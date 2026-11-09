@@ -61,6 +61,26 @@ class BareTextFinalizeObserver(BaseObserver):
             # Nothing said and no tool — let the loop's no-tool recovery nudge.
             return None
 
+        from workflows.agent_team.convergence import ESCALATE_STOP, current_convergence
+
+        convergence = current_convergence()
+        if (convergence is not None and convergence.phase not in {"finalizing", "finished"}
+                and convergence.snapshot()["receipts"]):
+            # One canonical control decision is shared by scheduling and final
+            # delivery. Plain text must not bypass a review of newly arrived
+            # reports, especially when one contains a substantive conflict.
+            return Intervention(
+                continue_to_next_turn=True,
+                inject_messages=[convergence.render_review_message()],
+            )
+        if (convergence is not None and convergence.tier_active
+                and convergence.phase not in {"finalizing", "finished"}):
+            # The cheap exit needs evidence too; zero research is not an answer.
+            message = convergence.reject_unsourced_answer()
+            if convergence.escalation_pending:
+                return Intervention(stop_reason=ESCALATE_STOP)
+            return Intervention(continue_to_next_turn=True, inject_messages=[message])
+
         scope = get_current_execution_scope()
         err = finalize_gate(
             ctx.task_id,

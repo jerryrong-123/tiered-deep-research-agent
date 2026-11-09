@@ -31,6 +31,11 @@ class PlanningGateObserver(BaseObserver):
         if not in_planning(ctx.task_id):
             return None
         name = str(tool_call.get("name", ""))
+        if name == "review_research":
+            from workflows.agent_team.convergence import current_convergence
+
+            if current_convergence() is not None:
+                return None
         block = planning_block_message(ctx.task_id, name)
         if block:
             return ToolCallIntervention(skip_with_result=block)

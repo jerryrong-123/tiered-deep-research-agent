@@ -3214,6 +3214,11 @@ async def arun_sandbox_cmd(
     128KB single-arg limit). Only passed through when set, so callers that
     don't need stdin (bash/grep) keep the original signature.
 
+    Backends with an ``input`` parameter receive it directly. E2B's SDK uses
+    a background command handle: send stdin, close it for EOF, then wait.
+    Cancellation kills the acquired handle, including one created after the
+    caller cancels; the worker closes its own event stream on completion.
+
     ``allow_net=True``: used by explicitly network-backed capabilities
     (read_file OCR/VISION, controlled downloads, and bash research). It is
     forwarded only when the backend supports the parameter (BwrapCommands);
@@ -3239,13 +3244,9 @@ async def arun_sandbox_cmd(
     """
     import asyncio
     await _ensure_ttl_outlives_exec(sandbox, timeout)
-    # Only forward ``input`` when set — E2B's commands.run has no stdin param,
-    # so unconditional passthrough would break the remote path.
     # Annotated: inferred from the first entry this became dict[str, int],
     # which then rejected the str / bool / tuple capabilities added below.
     kw: dict[str, Any] = {"timeout": timeout}
-    if input is not None:
-        kw["input"] = input
     # Forward explicit network/environment capabilities only to backends that
     # support them.
     optional: dict[str, Any] = {}
@@ -3253,19 +3254,83 @@ async def arun_sandbox_cmd(
         optional["allow_net"] = True
     if env_allow:
         optional["env_allow"] = env_allow
-    if optional:
+    supported: Mapping[str, Any] = {}
+    if input is not None or optional:
         try:
             import inspect
             supported = inspect.signature(sandbox.commands.run).parameters
             kw.update({key: value for key, value in optional.items() if key in supported})
         except (TypeError, ValueError):
             pass
+    stream_stdin = (
+        input is not None and "input" not in supported
+        and "stdin" in supported and "background" in supported
+    )
+    if input is not None:
+        if stream_stdin:
+            kw.update(background=True, stdin=True)
+        else:
+            kw["input"] = input
     if isinstance(sandbox, BwrapSandbox):
         async with _get_local_exec_sem(asyncio):
             return await asyncio.to_thread(
                 sandbox.commands.run, command, **kw,
             )
     try:
+        if stream_stdin:
+            cancelled = threading.Event()
+            handle_lock = threading.Lock()
+            stdin_handle: Any = None
+            kill_attempted = False
+
+            def kill_stdin_handle() -> None:
+                nonlocal kill_attempted
+                with handle_lock:
+                    target = stdin_handle
+                    if target is None or kill_attempted:
+                        return
+                    kill_attempted = True
+                try:
+                    target.kill()
+                except Exception as cleanup_error:
+                    logger.warning("E2B command kill failed (%s)", type(cleanup_error).__name__)
+
+            def run_with_stdin() -> Any:
+                nonlocal stdin_handle
+                handle = sandbox.commands.run(command, **kw)
+                with handle_lock:
+                    stdin_handle = handle
+                try:
+                    if cancelled.is_set():
+                        kill_stdin_handle()
+                        return None
+                    try:
+                        handle.send_stdin(input)
+                        handle.close_stdin()
+                    except BaseException:
+                        kill_stdin_handle()
+                        raise
+                    if cancelled.is_set():
+                        kill_stdin_handle()
+                        return None
+                    try:
+                        return handle.wait()
+                    except BaseException as wait_error:
+                        if type(wait_error).__name__ != "CommandExitException":
+                            kill_stdin_handle()
+                        raise
+                finally:
+                    # Only this worker owns the stream iterator. Closing it
+                    # from the cancelling thread can race an active wait().
+                    with contextlib.suppress(Exception):
+                        handle.disconnect()
+
+            try:
+                return await asyncio.to_thread(run_with_stdin)
+            except asyncio.CancelledError:
+                cancelled.set()
+                await asyncio.to_thread(kill_stdin_handle)
+                raise
         return await asyncio.to_thread(
             sandbox.commands.run, command, **kw,
         )

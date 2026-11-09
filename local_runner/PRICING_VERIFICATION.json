@@ -1,0 +1,26 @@
+{
+  "verified_at_utc": "2026-10-29T14:10:39+00:00",
+  "official_source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+  "model": "deepseek-flash",
+  "official_version": "DeepSeek-V4.1-Flash-1017",
+  "rates_cny_per_1M_offpeak": {
+    "cached": ".02",
+    "uncached": "1",
+    "output": "4"
+  },
+  "peak_multiplier": "2",
+  "official_peak_rule": "Beijing weekdays excluding China statutory holidays 09-12 and14-18; all other hours offpeak",
+  "verified_window_utc": {
+    "start": "2026-10-29T14:10:39+00:00",
+    "end_exclusive": "2026-10-30T01:00:00+00:00"
+  },
+  "inference": "The entire bounded attempt begins after22Beijing and ends byabout02; outside peak regardless of holiday classification. Window expires before09Beijing.",
+  "original_date_policy_retained_outside_window": true,
+  "reserves_unchanged_peak_upper_bound": true,
+  "hard_cap_cny": "25",
+  "target_cny": "20",
+  "maximum_attempts": 1,
+  "original_helpers_sha256": "0389d1397ade56fcb07436bda78b3a2ba844b139a9c53dc59447b0c0849c3529",
+  "fresh_helpers_sha256": "c3414cd0d2c4d37a7c0a38271694916b35f71fa0353c6bd89f32682f18473474",
+  "model_output_time_retry_changes": false
+}

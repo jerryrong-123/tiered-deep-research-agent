@@ -87,6 +87,7 @@ from plugins.tools._sandbox import (
     resolve_sandbox_mode,
     set_task_sandbox,
 )
+from plugins.tools._search_run_cache import search_run_cache
 from plugins.tools.assign_task import agent_team_assign_task
 from plugins.tools.document_node_toolchain import (
     render_document_node_toolchain_note,
@@ -100,6 +101,12 @@ from plugins.tools.task_board import (
     start_planning,
 )
 from workflows.agent_team.citation_url_repair import repair_citation_urls
+from workflows.agent_team.convergence import (
+    convergence_run,
+    current_convergence,
+    guard_tools,
+    wrap_llm,
+)
 from workflows.agent_team.identity import (
     MAIN_AGENT_ID,
     MAIN_ROLE_ID,
@@ -158,6 +165,15 @@ _TEAM_FINALIZATION_MESSAGE = (
     "current deliverables. Then return the best complete plain-text answer. "
     "If full completion is impossible, preserve existing artifacts and give a "
     "useful partial answer instead of ending with no deliverable and no answer."
+)
+
+_PROGRESSIVE_FINALIZATION_MESSAGE = (
+    "Finalization phase has started. Stop opening research branches. Review "
+    "saved direct-source evidence and completed helper reports against the "
+    "original question. Use review_research to finalize the best supported "
+    "sourced answer, or state the concrete remaining evidence limit. Do not "
+    "create a checker or wait for work that is no longer needed. Preserve "
+    "existing artifacts and report any incomplete deliverable honestly."
 )
 
 # Module-level LLM cache — one client per profile name, shared across tasks.
@@ -655,6 +671,7 @@ def _build_observers(
     finalization_reserve_turns: int = 8,
     wall_deadline_s: float = 0,
     force_compaction_first: bool = False,
+    progressive_research_v1: bool = False,
 ) -> list[Any]:
     observers: list[Any] = [
         BareTextFinalizeObserver(),
@@ -681,7 +698,10 @@ def _build_observers(
         build_task_board_observer(),
         FinalizationReserveObserver(
             reserve_turns=finalization_reserve_turns,
-            message=_TEAM_FINALIZATION_MESSAGE,
+            message=(
+                _PROGRESSIVE_FINALIZATION_MESSAGE if progressive_research_v1
+                else _TEAM_FINALIZATION_MESSAGE
+            ),
         ),
         LastTurnForcer(terminal_tool=MAIN_TERMINAL_TOOL),
         RichConsoleObserver(),
@@ -729,7 +749,7 @@ def _build_observers(
     return observers
 
 
-def _swarm_main_loop_policy() -> LoopPolicy:
+def _swarm_main_loop_policy(*, progressive_research_v1: bool = False) -> LoopPolicy:
     # No terminal tool: BareTextFinalizeObserver ends the loop when the agent
     # produces a plain-text answer with no tool call (and the gate passes).
     # The no-tool nudge below only fires on an EMPTY no-tool turn — a non-empty
@@ -738,6 +758,11 @@ def _swarm_main_loop_policy() -> LoopPolicy:
         terminal_tool_names=(),
         no_tool_behavior="nudge",
         no_tool_nudge_message=(
+            "You produced no output and called no tool. Continue targeted "
+            "research with the available tools, or use review_research to "
+            "decide whether the saved evidence supports the complete original "
+            "question. Delegate only a concrete approved evidence gap."
+        ) if progressive_research_v1 else (
             "You produced no output and called no tool. Either dispatch / "
             "collect from sub-agents (assign_task, collect_reports) to keep "
             "working, or — once every task-board item is resolved — deliver "
@@ -919,7 +944,66 @@ async def main_agent_node(
         profile_overrides=metadata.get("profile_overrides"),
         profile_inline=metadata.get("profile_inline"),
     )
+    run_agent_cfg = (profile or {}).get("agent", {})
+    progressive_enabled = run_agent_cfg.get("progressive_research_v1") is True
 
+    # A run owns this context, including every inherited sub-agent task. The
+    # context manager resets its token on return, setup failure or cancellation.
+    # Only an explicit YAML boolean enables reuse; default execution stays off.
+    with search_run_cache(
+        enabled=run_agent_cfg.get("share_search_results") is True,
+    ), convergence_run(
+        enabled=run_agent_cfg.get("convergence_v1") is True or progressive_enabled,
+        bus_task_id=str(metadata.get("bus_task_id") or ctx.task_id),
+        question=question,
+        progressive_research_v1=progressive_enabled,
+        progressive_config=run_agent_cfg.get("progressive_config"),
+    ) as convergence:
+        try:
+            return await _run_main_agent_node(
+                state, ctx, question=question, metadata=metadata,
+                profile_name=profile_name, llm=llm, profile=profile,
+                model_profile=model_profile,
+            )
+        finally:
+            if convergence is not None:
+                # This also covers setup failures, cancellation and provider
+                # errors before the normal delivery boundary is reached.
+                if convergence.phase != "finished":
+                    convergence.request_finalization("main_run_exited")
+                    bus = registry.get_optional(AgentBus)
+                    if bus is not None:
+                        from workflows.agent_team.convergence_cleanup import cleanup_converged_task
+
+                        outcome = await cleanup_converged_task(bus, convergence.bus_task_id)
+                        convergence.observe_reports(outcome.reports)
+                        convergence.note(
+                            "exit_cleanup", confirmed=outcome.cleanup_confirmed,
+                            pending_job_ids=outcome.pending_job_ids,
+                        )
+                    convergence.mark_finished()
+                directory = _resolve_trajectory_dir(
+                    state, ctx.task_id, str(metadata.get("trajectory_subdir") or ""),
+                )
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "convergence_v1.json").write_text(
+                    json.dumps(convergence.snapshot(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+
+async def _run_main_agent_node(
+    state: dict[str, Any],
+    ctx: NodeContext,
+    *,
+    question: str,
+    metadata: dict[str, Any],
+    profile_name: str | None,
+    llm: Any,
+    profile: dict[str, Any] | None,
+    model_profile: ModelProfile | None,
+) -> dict[str, Any]:
+    """Run the existing coordinator with the already resolved profile and LLM."""
     agent_cfg = (profile or {}).get("agent", {})
     # Model's declared per-call output cap (``llm.max_tokens``). Threaded to
     # the sub-agent runtime so ``_bind_sub_agent_llm`` never requests MORE
@@ -1066,7 +1150,8 @@ async def main_agent_node(
             input_sources.append(src)
         inputs_available = any(_has_input_files(str(src)) for src in input_sources)
     stream_repetition_config = parse_stream_repetition_config(agent_cfg)
-    sub_agent_llm = llm
+    sub_agent_llm = wrap_llm(llm, coordinator=False)
+    llm = wrap_llm(llm, coordinator=True)
     llm, stream_repetition_observer = wrap_llm_for_stream_repetition(
         llm,
         config=stream_repetition_config,
@@ -1155,10 +1240,47 @@ async def main_agent_node(
         dynamic_names=dynamic_tool_names,
     )
     sub_agent_tools = _replace_profile_tool_impls(sub_agent_tools, agent_cfg)
+    convergence = current_convergence()
+    progressive_enabled = convergence is not None and convergence.progressive is not None
+    base_main_tools = list(tools)
+    team_tool_names = set(agent_cfg.get("team_main_agent_tools") or ())
+    if convergence is not None and convergence.tier_active and (
+        not team_tool_names
+        or not team_tool_names <= {getattr(tool, "name", "") for tool in base_main_tools}
+    ):
+        raise ValueError("team_main_agent_tools_must_be_listed_main_agent_tools")
+
+    def _progressive_active() -> bool:
+        # Tiered runs leave progressive mode partway through the run.
+        return convergence is not None and convergence.progressive is not None
+
+    if convergence is not None:
+        async def _drain_before_decision() -> None:
+            # Close the race between the last fan-in and the decision. Reports
+            # already ready for this run must be visible before committing.
+            from frontier_agent.components.agent_bus.fan_in import process_collected
+
+            active_bus = registry.get(AgentBus)
+            ready_reports = []
+            while True:
+                ready = await active_bus.wait_any_session(bus_task_id, timeout=0.0)
+                if ready is None:
+                    break
+                ready_reports.append(ready)
+            if ready_reports:
+                convergence.observe_reports(ready_reports)
+                process_collected(active_bus, bus_task_id, ready_reports)
+
+        tools = guard_tools(
+            [*tools, convergence.review_tool(before_decision=_drain_before_decision)],
+            coordinator=True,
+        )
+        sub_agent_tools = guard_tools(sub_agent_tools, coordinator=False)
+        tool_names = [getattr(tool, "name", "") for tool in tools]
     main_document_toolchain_note = render_document_node_toolchain_note(
         sandbox_mode=sandbox_mode,
-        tool_names=sub_agent_tool_names,
-        audience="coordinator",
+        tool_names=tool_names if progressive_enabled else sub_agent_tool_names,
+        audience="agent" if progressive_enabled else "coordinator",
     )
     sub_document_toolchain_note = render_document_node_toolchain_note(
         sandbox_mode=sandbox_mode,
@@ -1196,42 +1318,70 @@ async def main_agent_node(
             p = f"{p}\n\n{_prompt_addendum}"
         if fs_enabled:
             p = f"{p}{main_fs_note}"
-        return f"{p}{render_team_effort(agent_cfg.get('team_effort', 'max'))}"
+        effort_note = render_team_effort(
+            agent_cfg.get("team_effort", "max"),
+            progressive_research_v1=_progressive_active(),
+        )
+        return f"{p}{effort_note}"
 
     event_store = registry.get_optional(EventStore)
     traj_dir = _resolve_trajectory_dir(state, ctx.task_id, trajectory_subdir)
-    observers = _build_observers(
-        traj_dir=traj_dir,
-        task_id=ctx.task_id,
-        budget_tokens=budget_tokens,
-        max_input_tokens=max_input_tokens,
-        event_store=event_store,
-        tool_names=tool_names,
-        tools=tools,
-        run_id=str(metadata.get("run_id") or ""),
-        run_type=str(metadata.get("run_type") or ""),
-        finalization_reserve_turns=finalization_reserve_turns,
-        wall_deadline_s=wall_deadline_s,
-        force_compaction_first=(context_compaction == "tiered" and max_len > 0),
-    )
-    # A serve/CLI driver injects its own protocol-stream and worker-trace
-    # observers via state.metadata["sdk_extra_observers"] (see
-    # ``workflows/_shared/sdk_shim``). The HTTP API path leaves this key
-    # unset → no behavior change.
-    extra_observers = metadata.get("sdk_extra_observers") or []
-    if extra_observers:
-        observers = list(observers) + list(extra_observers)
-    if stream_repetition_observer is not None:
-        observers.append(stream_repetition_observer)
-    if main_gauge is not None:
-        observers.append(main_gauge)  # feeds the real-token compaction trigger
-    # Single-loop planning (planning_mode on, fresh_execution_context off):
-    # this observer is the in-loop Planning Mode enforcer — it blocks non
-    # read-only / non-board tools while planning and auto-finishes planning at
-    # planning_max_turns. NOT needed on the two-loop path (the planning loop is
-    # already tool-restricted + max_turns-capped) or when planning is off.
-    if planning_mode and not fresh_execution_context:
-        observers.append(PlanningGateObserver(planning_max_turns=planning_max_turns))
+    if convergence is not None:
+        from workflows.agent_team.observers.convergence import ConvergenceObserver
+
+    def _assemble_observers(
+        *, loop_tools: list[Any], loop_tool_names: list[str],
+        traj_filename: str = "main_agent", deadline_s: float = wall_deadline_s,
+    ) -> list[Any]:
+        assembled = _build_observers(
+            traj_dir=traj_dir,
+            traj_filename=traj_filename,
+            task_id=ctx.task_id,
+            budget_tokens=budget_tokens,
+            max_input_tokens=max_input_tokens,
+            event_store=event_store,
+            tool_names=loop_tool_names,
+            tools=loop_tools,
+            run_id=str(metadata.get("run_id") or ""),
+            run_type=str(metadata.get("run_type") or ""),
+            finalization_reserve_turns=finalization_reserve_turns,
+            wall_deadline_s=deadline_s,
+            force_compaction_first=(context_compaction == "tiered" and max_len > 0),
+            progressive_research_v1=_progressive_active(),
+        )
+        if convergence is not None:
+            # Run after AutoFanIn so reports drained without an explicit collect
+            # call receive the same mandatory next-turn decision.
+            assembled.insert(3, ConvergenceObserver())
+            for observer in assembled:
+                if isinstance(observer, TextRepetitionGuard):
+                    observer.hint_message = (
+                        "Review the reports already received. Wait only for work "
+                        "needed to resolve a concrete remaining condition or "
+                        "substantive conflict. Use review_research to finalize "
+                        "when the original question is sufficiently supported."
+                    )
+        # A serve/CLI driver injects its own protocol-stream and worker-trace
+        # observers via state.metadata["sdk_extra_observers"] (see
+        # ``workflows/_shared/sdk_shim``). The HTTP API path leaves this key
+        # unset → no behavior change.
+        extra_observers = metadata.get("sdk_extra_observers") or []
+        if extra_observers:
+            assembled = list(assembled) + list(extra_observers)
+        if stream_repetition_observer is not None:
+            assembled.append(stream_repetition_observer)
+        if main_gauge is not None:
+            assembled.append(main_gauge)  # feeds the real-token compaction trigger
+        # Single-loop planning (planning_mode on, fresh_execution_context off):
+        # this observer is the in-loop Planning Mode enforcer — it blocks non
+        # read-only / non-board tools while planning and auto-finishes planning at
+        # planning_max_turns. NOT needed on the two-loop path (the planning loop is
+        # already tool-restricted + max_turns-capped) or when planning is off.
+        if planning_mode and not fresh_execution_context:
+            assembled.append(PlanningGateObserver(planning_max_turns=planning_max_turns))
+        return assembled
+
+    observers = _assemble_observers(loop_tools=tools, loop_tool_names=tool_names)
 
     # WORKER_TRACE_DIR plumbing: SDK driver puts trace_dir + workflow_id
     # into state.metadata so sub-agents write per-session JSON files.
@@ -1325,7 +1475,7 @@ async def main_agent_node(
             (sub_fs_note if fs_enabled else "")
             + sub_document_toolchain_note
         ),
-        sub_agent_llm=sub_agent_llm if profile_name else None,
+        sub_agent_llm=sub_agent_llm if (profile_name or convergence is not None) else None,
         llm_max_tokens=llm_max_tokens,
         sub_agent_llm_timeout=llm_timeout,
         sub_agent_tool_timeout=tool_timeout,
@@ -1440,10 +1590,36 @@ async def main_agent_node(
         "workspace_root": shared_workspace_dir,
     }
 
+    light_started = time.monotonic()
+
     async def _run_main_loop(
         *, system_prompt: str, user_message: str, loop_tools: list[Any],
         loop_observers: list[Any], loop_policy: LoopPolicy, turns: int,
     ) -> AgentLoopResult:
+        if convergence is not None:
+            system_prompt += (
+                "\n\nPROGRESSIVE CONVERGENCE: Direct source-tool results are "
+                "recorded in the same evidence state as actual helper reports; "
+                "each successful read does not require an extra review turn. "
+                "At a strategy checkpoint or after a helper report, use the "
+                "next existing main turn to review sufficiency. When the "
+                "original question is supported, finalize through review_research "
+                "without waiting for unnecessary work or adding a checker. "
+                "Preserve substantive conflicts and name concrete gaps when "
+                "continuing. The saved source receipt is provenance, not a "
+                "semantic approval."
+            ) if _progressive_active() else (
+                "\n\nCONVERGENCE V1: After a real report arrives, the next "
+                "existing coordinator turn must call review_research. Check "
+                "the complete original question, saved evidence, object/event "
+                "bindings and every received substantive conflict. Finalize "
+                "with the complete sourced answer when sufficient; otherwise "
+                "name concrete missing evidence, not merely unfinished sibling "
+                "tasks. Do not require disproof of every unsubstantiated rival. "
+                "Program control blocks new research until that decision. "
+                "A finalize decision cancels remaining research; it is your "
+                "semantic judgment, not automatic verification of the sources."
+            )
         return await run_agent_loop(
             system_prompt=system_prompt,
             user_message=user_message,
@@ -1489,6 +1665,7 @@ async def main_agent_node(
         # so dropping the messages does not lose it).
         planning_tools = [
             t for t in tools if is_planning_allowed(getattr(t, "name", ""))
+            or (convergence is not None and getattr(t, "name", "") == "review_research")
         ]
         planning_tool_names = [
             getattr(t, "name", "") for t in planning_tools if getattr(t, "name", "")
@@ -1508,6 +1685,8 @@ async def main_agent_node(
             ReactStepTracker(),
             LastTurnForcer(terminal_tool="finish_planning"),
         ]
+        if convergence is not None:
+            planning_observers[1:1] = [AutoFanInObserver(), ConvergenceObserver()]
         if DuplicateQueryRollbackObserver.DEFAULT_TOOL_NAMES.intersection(
             planning_tool_names,
         ):
@@ -1521,12 +1700,15 @@ async def main_agent_node(
                 run_id=str(metadata.get("run_id") or ""),
                 run_type=str(metadata.get("run_type") or ""),
             ))
-        await _run_main_loop(
+        planning_result = await _run_main_loop(
             system_prompt=_decorate(get_main_system_prompt(
                 date_str, fs_mode=fs_mode, phase="planning",
                 sub_agent_tools=sub_agent_tool_names,
                 mcp_tool_names=mcp_tool_names, mcp_tool_specs=mcp_tool_specs,
                 document_toolchain_note=main_document_toolchain_note,
+                progressive_research_v1=progressive_enabled,
+                main_agent_tools=planning_tool_names,
+                progressive_config=agent_cfg.get("progressive_config"),
             )),
             user_message=question,
             loop_tools=planning_tools,
@@ -1534,26 +1716,37 @@ async def main_agent_node(
             loop_policy=_planning_loop_policy(),
             turns=planning_max_turns,
         )
-        # Loop ended on finish_planning OR planning_max_turns — ensure execution.
-        # (no-op if already in execution; force_finish_planning self-guards.)
-        force_finish_planning(ctx.task_id)
-        exec_user = (
-            f"{question}\n\n--- YOUR TASK BOARD (from planning) ---\n"
-            f"{render_board(ctx.task_id, bus_task_id=bus_task_id)}"
-        )
-        result = await _run_main_loop(
-            system_prompt=_decorate(get_main_system_prompt(
-                date_str, fs_mode=fs_mode, phase="execution",
-                sub_agent_tools=sub_agent_tool_names,
-                mcp_tool_names=mcp_tool_names, mcp_tool_specs=mcp_tool_specs,
-                document_toolchain_note=main_document_toolchain_note,
-            )),
-            user_message=exec_user,
-            loop_tools=tools,
-            loop_observers=observers,
-            loop_policy=_swarm_main_loop_policy(),
-            turns=max_turns,
-        )
+        if convergence is not None and (
+            planning_result.stopped_by == "final_answer" or planning_result.metadata.get("final_answer")
+            or convergence.escalation_pending
+        ):
+            # A review has already supplied the answer, or asked for the team.
+            # Neither needs the execution loop of the light path.
+            result = planning_result
+        else:
+            # Loop ended on finish_planning OR planning_max_turns — ensure execution.
+            # (no-op if already in execution; force_finish_planning self-guards.)
+            force_finish_planning(ctx.task_id)
+            exec_user = (
+                f"{question}\n\n--- YOUR TASK BOARD (from planning) ---\n"
+                f"{render_board(ctx.task_id, bus_task_id=bus_task_id)}"
+            )
+            result = await _run_main_loop(
+                system_prompt=_decorate(get_main_system_prompt(
+                    date_str, fs_mode=fs_mode, phase="execution",
+                    sub_agent_tools=sub_agent_tool_names,
+                    mcp_tool_names=mcp_tool_names, mcp_tool_specs=mcp_tool_specs,
+                    document_toolchain_note=main_document_toolchain_note,
+                    progressive_research_v1=progressive_enabled,
+                    main_agent_tools=tool_names,
+                    progressive_config=agent_cfg.get("progressive_config"),
+                )),
+                user_message=exec_user,
+                loop_tools=tools,
+                loop_observers=observers,
+                loop_policy=_swarm_main_loop_policy(progressive_research_v1=progressive_enabled),
+                turns=max_turns,
+            )
     else:
         # ── Single-loop path ─────────────────────────────────────────────────
         # planning_mode off → no gate; planning_mode on + fresh off → planning
@@ -1566,9 +1759,54 @@ async def main_agent_node(
                 sub_agent_tools=sub_agent_tool_names,
                 mcp_tool_names=mcp_tool_names, mcp_tool_specs=mcp_tool_specs,
                 document_toolchain_note=main_document_toolchain_note,
+                progressive_research_v1=progressive_enabled,
+                main_agent_tools=tool_names,
+                progressive_config=agent_cfg.get("progressive_config"),
             )),
             user_message=question,
             loop_tools=tools,
+            loop_observers=observers,
+            loop_policy=_swarm_main_loop_policy(progressive_research_v1=progressive_enabled),
+            turns=max_turns,
+        )
+
+    if convergence is not None and convergence.stops_at_escalation:
+        # A closing synthesis runs after cleanup, so it sees late helper reports.
+        if not convergence.synthesizes_at_stop:
+            # A present final answer also skips the forced-synthesis model call.
+            result.metadata["final_answer"] = convergence.stop_marker()
+            result.metadata["final_answer_source"] = "stopped_at_escalation"
+    elif convergence is not None and convergence.escalation_pending:
+        # Same run, budget, bus and evidence state, as with a fresh execution
+        # loop above. Only the coordinator's strategy and tools change. Helpers
+        # already running stay on the bus and report to the team coordinator.
+        team_message = convergence.begin_team_stage()
+        team_tools = guard_tools(
+            [*[item for item in base_main_tools if getattr(item, "name", "") in team_tool_names],
+             convergence.review_tool(before_decision=_drain_before_decision)],
+            coordinator=True,
+        )
+        team_names = [getattr(item, "name", "") for item in team_tools]
+        team_deadline_s = wall_deadline_s
+        if wall_deadline_s > 0:
+            # The observer times its own loop, so pass only what remains.
+            team_deadline_s = max(wall_deadline_s - (time.monotonic() - light_started), 1.0)
+        observers = _assemble_observers(
+            loop_tools=team_tools, loop_tool_names=team_names,
+            traj_filename="main_agent_team", deadline_s=team_deadline_s,
+        )
+        result = await _run_main_loop(
+            system_prompt=_decorate(get_main_system_prompt(
+                date_str, fs_mode=fs_mode, planning_mode=False, phase="combined",
+                sub_agent_tools=sub_agent_tool_names,
+                mcp_tool_names=mcp_tool_names, mcp_tool_specs=mcp_tool_specs,
+                document_toolchain_note=render_document_node_toolchain_note(
+                    sandbox_mode=sandbox_mode, tool_names=sub_agent_tool_names,
+                    audience="coordinator",
+                ),
+            )),
+            user_message=team_message,
+            loop_tools=team_tools,
             loop_observers=observers,
             loop_policy=_swarm_main_loop_policy(),
             turns=max_turns,
@@ -1577,6 +1815,29 @@ async def main_agent_node(
     reset_filesystem_state(fs_token)
     if main_sb_token is not None:
         clear_task_sandbox(main_sb_token)
+    early_evidence: list[dict[str, Any]] = []
+    early_assertions: list[dict[str, Any]] = []
+    cleanup_status: dict[str, Any] = {}
+    if convergence is not None:
+        from workflows.agent_team.convergence_cleanup import cleanup_converged_task
+
+        convergence.request_finalization(result.stopped_by or "main_loop_ended")
+        outcome = await cleanup_converged_task(bus, bus_task_id)
+        early_evidence.extend(outcome.evidence_cards)
+        early_assertions.extend(outcome.assertions)
+        convergence.observe_reports(outcome.reports)
+        cleanup_status = {
+            "scope": "native_runtime_only_remote_settlement_not_confirmed",
+            "cleanup_confirmed": outcome.cleanup_confirmed,
+            "pending_job_ids": outcome.pending_job_ids,
+            "cleaned_count": outcome.cleaned_count,
+            "errors": outcome.errors,
+        }
+        convergence.note("pre_delivery_cleanup", **cleanup_status)
+        if convergence.settles_answer:
+            from workflows.agent_team.answer_settlement import settle_answer
+
+            await settle_answer(convergence, result, llm, finalization_timeout_s)
     if reporter_enabled:
         # The downstream reporter owns final synthesis and its fallback chain.
         # Avoid spending a duplicate coordinator LLM call here; preserve a
@@ -1587,17 +1848,21 @@ async def main_agent_node(
             task_description=question,
         )
     else:
-        result = await force_final_answer(
-            result,
-            llm,
-            finalization_timeout_s,
-            task_description=question,
-            structured_report=False,
-        )
+        if convergence is not None:
+            with convergence.finalization_scope():
+                result = await force_final_answer(
+                    result, llm, finalization_timeout_s,
+                    task_description=question, structured_report=False,
+                )
+        else:
+            result = await force_final_answer(
+                result, llm, finalization_timeout_s,
+                task_description=question, structured_report=False,
+            )
 
     aggregate = bus.drain_task_metadata(bus_task_id)
-    sub_evidence = list(aggregate.get("evidence_cards", []))
-    sub_assertions = list(aggregate.get("assertions", []))
+    sub_evidence = early_evidence + list(aggregate.get("evidence_cards", []))
+    sub_assertions = early_assertions + list(aggregate.get("assertions", []))
 
     main_evidence = list(result.metadata.get("evidence_cards", []))
     main_assertions = list(result.metadata.get("assertions", []))
@@ -1616,9 +1881,14 @@ async def main_agent_node(
     )
 
     try:
-        cleaned = await asyncio.wait_for(
-            bus.cleanup_task(bus_task_id), timeout=45.0,
-        )
+        if convergence is not None:
+            # The bounded pre-delivery cleanup owns the opt-in lifecycle.
+            # Do not run the old wait_for chain again after publishing.
+            cleaned = 0
+        else:
+            cleaned = await asyncio.wait_for(
+                bus.cleanup_task(bus_task_id), timeout=45.0,
+            )
         if cleaned:
             logger.info("Swarm cleanup: dropped %d session(s)", cleaned)
     except TimeoutError:
@@ -1712,6 +1982,9 @@ async def main_agent_node(
     # long-lived worker process (no-op if the agent never used add_task).
     clear_board(ctx.task_id)
 
+    if convergence is not None:
+        convergence.mark_finished()
+
     return {
         "final_answer": final_text,
         # Mirror to ``final_content`` so the scheduler's terminal-output
@@ -1769,6 +2042,8 @@ async def main_agent_node(
         "turns_used": result.turns_used,
         "tool_calls_count": result.tool_calls_count,
         "stopped_by": result.stopped_by or "",
+        **({"convergence": convergence.snapshot(), "research_cleanup": cleanup_status}
+           if convergence is not None else {}),
         # The terminal/TUI must be able to distinguish an infrastructure or
         # provider failure from a completed report. Keep the provider response
         # out of the fallback prose and carry it as structured run metadata.

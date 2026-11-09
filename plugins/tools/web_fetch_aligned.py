@@ -21,6 +21,14 @@ from frontier_agent.infra.summary_llm import (
     summary_llm_candidates,
 )
 from frontier_agent.infra.usage_meter import record_api_request, record_llm_usage
+from plugins.tools._archive_copy import (
+    copy_url,
+    current_archive_reads,
+    page_text,
+    reports_missing,
+    saved_on,
+    worth_a_saved_copy,
+)
 from plugins.tools._bounded_fetch import (
     MAX_REDIRECT_HOPS,
     RedirectRefused,
@@ -104,6 +112,9 @@ _MIN_RENDERED_BODY_CHARS = MIN_RENDERED_BODY_CHARS
 # yields a 285-byte shell, with it 4945+ bytes of content.
 _JINA_TIMEOUT_S = 30
 _JINA_RETRY_TIMEOUT_S = 40
+# A saved page came back in 3 to 4 seconds when measured. Retries of a hung
+# request must not hold up a tool call that already has a result to return.
+_ARCHIVE_READ_TIMEOUT_S = 45
 
 
 # ── Jina scraping ─────────────────────────────────────────────────────
@@ -544,6 +555,58 @@ async def _extract_with_candidate(
     }
 
 
+# ── Saved copy of a page the live web did not deliver ─────────────────
+
+
+async def _saved_page_text(saved: str) -> str:
+    """Read a saved page directly, which costs nothing; else through the reader.
+
+    The direct fetch hands a PDF back as raw bytes, which only the reader can
+    turn into text.
+    """
+    try:
+        scrape = await asyncio.wait_for(
+            _scrape_url_with_python(saved), _ARCHIVE_READ_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return ""
+    if scrape["success"] and not scrape["content"].startswith("%PDF"):
+        return await asyncio.to_thread(page_text, scrape["content"])
+    scrape = await _scrape_url_with_jina(saved)
+    return scrape["content"] if scrape["success"] else ""
+
+
+async def _read_saved_copy(
+    url: str, info_to_extract: str, *, live_failed: bool,
+) -> str | None:
+    """Extract from the newest saved copy, or ``None`` to keep the live result.
+
+    When the live page failed, a real copy beats it even if the fact is not
+    there. When the live page only lacked the fact, the copy must have it.
+    """
+    allowance = current_archive_reads()
+    if allowance is None or allowance.spent or not worth_a_saved_copy(url):
+        return None
+    stamp = await allowance.snapshot(url)
+    if stamp is None or not allowance.take():
+        return None
+    saved = copy_url(stamp, url)
+    text = await _saved_page_text(saved)
+    if _unrendered_kind(text) is not None:
+        return None
+    result = await _extract_info_with_llm(text, info_to_extract)
+    if not result["success"]:
+        return None
+    extracted = (result["extracted_info"] or "").strip()
+    if not extracted or (not live_failed and reports_missing(extracted)):
+        return None
+    # After the text: the guard recognises a withheld page by how it starts.
+    return (
+        f"{extracted}\n\n[ARCHIVE COPY] The live page did not give this, so this "
+        f"comes from a copy of {url} saved on {saved_on(stamp)}: {saved}"
+    )
+
+
 # ── Single-URL fetch + extract ────────────────────────────────────────
 
 
@@ -670,13 +733,23 @@ async def _fetch_single(
                 should_cache=lambda scraped: _render_kind(scraped) is None,
             )
     except ScrapeUnavailable as exc:
-        return f"[ERROR]: Scraping failed: {exc}"
+        recovered = await _read_saved_copy(url, info_to_extract, live_failed=True)
+        return recovered or f"[ERROR]: Scraping failed: {exc}"
 
     result = await _extract_info_with_llm(content, info_to_extract)
     if not result["success"]:
         return f"[ERROR]: Extraction failed: {result['error']}"
     extracted = result["extracted_info"]
-    if _render_kind(content) == "empty":
+    not_rendered = _render_kind(content) == "empty"
+    # With no focus the page comes back raw, and no extractor has judged it.
+    focused = bool(info_to_extract and info_to_extract.strip())
+    if not_rendered or (focused and reports_missing(extracted)):
+        recovered = await _read_saved_copy(
+            url, info_to_extract, live_failed=not_rendered,
+        )
+        if recovered:
+            return recovered
+    if not_rendered:
         return (
             f"[POSSIBLY NOT RENDERED] The page at {url} remained suspiciously "
             "short after the browser-render retry. This result was deliberately "

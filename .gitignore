@@ -60,3 +60,10 @@ private/
 
 # User specific claude configurations
 .claude
+
+# Local research inputs, credentials and generated artifacts
+runtime.env
+secrets/
+outputs/
+.research_receipts/
+QUESTION*.json

@@ -37,6 +37,7 @@ _MAX_FILENAME = 180
 _PART_RE = re.compile(r"\.part-\d+x[0-9a-f]{8}-(\d+)$")
 
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_TEREDO_NETWORK = ipaddress.ip_network("2001::/32")
 _ALLOWED_EXTENSIONS = frozenset({
     ".csv", ".doc", ".docx", ".epub", ".gif", ".gz", ".htm", ".html",
     ".jpeg", ".jpg", ".json", ".md", ".odp", ".ods", ".odt", ".pdf",
@@ -130,6 +131,21 @@ def _opener(ip: str) -> urllib.request.OpenerDirector:
     )
 
 
+def _is_tolerated_dns_poison(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Opt-in for networks whose resolver injects Teredo-range AAAA answers.
+
+    Such an answer (seen as ``2001::1``) makes a public name look non-public,
+    and the fetch is refused before the remote reader ever receives it. Only
+    this one range is ignored, and only beside a public IPv4 answer; every
+    private, loopback and link-local address is still refused.
+    """
+    return (
+        os.getenv("FRONTIER_AGENT_TOLERATE_DNS_POISON", "").strip() == "1"
+        and ip.version == 6
+        and ip in _TEREDO_NETWORK
+    )
+
+
 def _validate_public_url(url: str) -> tuple[str, ...]:
     """Vet *url* and return every public IP the request may be sent to.
 
@@ -159,9 +175,14 @@ def _validate_public_url(url: str) -> tuple[str, ...]:
     if not addresses:
         raise DownloadError(f"cannot resolve {parsed.hostname}")
     validated: list[tuple[int, str]] = []
+    public_ipv4 = any(
+        ip.version == 4 and ip.is_global for ip in map(ipaddress.ip_address, addresses)
+    )
     for address in addresses:
         ip = ipaddress.ip_address(address)
         if not ip.is_global:
+            if public_ipv4 and _is_tolerated_dns_poison(ip):
+                continue
             raise DownloadError(
                 f"refusing non-public address for {parsed.hostname}: {ip}",
             )

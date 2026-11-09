@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from contextvars import ContextVar, Token
 from functools import lru_cache
@@ -19,6 +20,17 @@ from plugins.tools._parallel_search import (
     selected_search_provider,
     valid_search_provider,
 )
+from plugins.tools._search_contract import (
+    SEARCH_ERROR_KEY as SEARCH_ERROR_KEY,
+)
+from plugins.tools._search_contract import (
+    _SEARCH_ERROR_REASONS as _SEARCH_ERROR_REASONS,
+)
+from plugins.tools._search_contract import (
+    _format_search_error,
+    _search_failure,
+)
+from plugins.tools._search_run_cache import cached_search_result
 from plugins.tools._single_flight import SingleFlightCoalescer
 
 logger = logging.getLogger(__name__)
@@ -37,6 +49,8 @@ _search_coalescer = SingleFlightCoalescer("web_search", meter_provider="serper")
 # otherwise-identical sibling queries share one cache entry. Bucketing *up*
 # only ever returns >= the requested count, so the tool can slice down safely.
 _NUM_BUCKETS = (10, 20, 50, 100)
+_FREE_PLAN_REFUSAL = "not allowed for free accounts"
+_FREE_PLAN_OPERATOR_NUM = 10
 
 
 def _canonical_num(n: int) -> int:
@@ -195,10 +209,30 @@ def is_domain_blocked(url: str) -> bool:
     return _domain_matches(url, _extra_blacklist())
 
 
+_low_value_results_visible: ContextVar[bool] = ContextVar(
+    "_low_value_results_visible", default=False,
+)
+
+
+def set_low_value_results_visible(visible: bool) -> Token:
+    """Show the built-in low-value domains in search display for this context.
+
+    Operator hard blocks still apply. Pair with
+    :func:`reset_low_value_results_visible` in a ``finally`` block.
+    """
+    return _low_value_results_visible.set(visible)
+
+
+def reset_low_value_results_visible(token: Token) -> None:
+    """Restore the previous visibility (paired with the setter above)."""
+    _low_value_results_visible.reset(token)
+
+
 def _combined_blacklist() -> frozenset[str]:
     """Built-in low-value filter ∪ operator extra — hoist out of
     per-result loops (the union rebuilds a set each call)."""
-    return _DOMAIN_BLACKLIST | _extra_blacklist()
+    builtin = frozenset() if _low_value_results_visible.get() else _DOMAIN_BLACKLIST
+    return builtin | _extra_blacklist()
 
 
 # ── Domain-scoped snippet/title content filter ────────────────────────
@@ -277,6 +311,9 @@ async def raw_web_search(
     """Execute search and return full Serper response dict.
 
     Returns dict with keys: organic, answerBox, knowledgeGraph, peopleAlsoAsk, etc.
+    Failures return the reserved ``SEARCH_ERROR_KEY`` metadata described above;
+    an empty successful response has no error field. No failure is raised to
+    raw dictionary consumers.
     Retries on 429/5xx with exponential backoff.
 
     ``num_results`` is snapped up to a coarse bucket so that otherwise-identical
@@ -288,8 +325,18 @@ async def raw_web_search(
     # Key mirrors the canonical request body — NEVER add control fields here or
     # to the body itself: the proxy cache key is ``hash(url + body)``.
     key = f"{query}\x1f{num}\x1f{gl}\x1f{hl}\x1f{tbs}"
-    return await _search_coalescer.run(
-        key, lambda: _do_web_search(query, num, gl, hl, tbs),
+    config = get_config()
+    cache_key = (
+        "serper", config.serper_base_url,
+        hashlib.sha256((config.serper_api_key or "").encode()).digest(),
+        query, num, gl, hl, tbs,
+    )
+    return await cached_search_result(
+        cache_key,
+        lambda: _search_coalescer.run(
+            key, lambda: _do_web_search(query, num, gl, hl, tbs),
+        ),
+        on_cache_hit=lambda: record_api_request("serper", requests=0, cache_hits=1),
     )
 
 
@@ -304,7 +351,7 @@ async def _do_web_search(
     config = get_config()
 
     if not config.serper_api_key:
-        return {}
+        return _search_failure("configuration_error")
 
     url = f"{config.serper_base_url}/search"
     headers = {"X-API-KEY": config.serper_api_key, "Content-Type": "application/json"}
@@ -318,12 +365,14 @@ async def _do_web_search(
     if tbs:
         payload["tbs"] = tbs
 
+    last_failure = _search_failure("unexpected_error")
     for attempt in range(_MAX_RETRIES):
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(url, headers=headers, json=payload)
 
                 if resp.status_code == 429:
+                    last_failure = _search_failure("rate_limited", resp.status_code)
                     wait = 2 ** attempt
                     logger.warning("Serper 429 rate limited, retrying in %ds (attempt %d)", wait, attempt + 1)
                     record_api_request("serper", requests=0, retries=1)
@@ -331,37 +380,70 @@ async def _do_web_search(
                     continue
 
                 if resp.status_code >= 500:
+                    last_failure = _search_failure("server_error", resp.status_code)
                     wait = 2 ** attempt
                     logger.warning("Serper %d server error, retrying in %ds (attempt %d)", resp.status_code, wait, attempt + 1)
                     record_api_request("serper", requests=0, retries=1)
                     await asyncio.sleep(wait)
                     continue
 
+                if (resp.status_code == 400 and payload["num"] > _FREE_PLAN_OPERATOR_NUM
+                        and _FREE_PLAN_REFUSAL in resp.text):
+                    # Free accounts refuse quoted or site: queries above this
+                    # size, so only the requested size changes on this retry.
+                    payload["num"] = _FREE_PLAN_OPERATOR_NUM
+                    last_failure = _search_failure("http_error", resp.status_code)
+                    logger.warning("Serper refused this query size, retrying with num=%d", _FREE_PLAN_OPERATOR_NUM)
+                    record_api_request("serper", requests=0, retries=1)
+                    continue
+
                 resp.raise_for_status()
                 # Count one answered, billable Serper query.
                 record_api_request("serper")
-                return resp.json()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    logger.error("Serper search failed (invalid_response)")
+                    return _search_failure("invalid_response")
+                if not isinstance(data, dict):
+                    logger.error("Serper search failed (invalid_response)")
+                    return _search_failure("invalid_response")
+                provider_status = data.get("statusCode")
+                if data.get("error") or (
+                    type(provider_status) is int and 400 <= provider_status <= 599
+                ):
+                    # A provider may reject a query inside an HTTP 200 payload.
+                    # Keep the actual transport status and discard its message.
+                    logger.error("Serper search failed (provider_error; HTTP %d)", resp.status_code)
+                    record_api_request("serper", requests=0, errors=1)
+                    return _search_failure("provider_error", resp.status_code)
+                return data
 
         except httpx.TimeoutException:
-            logger.warning("Serper search timeout for '%s' (attempt %d)", query[:50], attempt + 1)
+            logger.warning("Serper search failed (timeout; attempt %d)", attempt + 1)
             record_api_request("serper", requests=0, errors=1)
             if attempt < _MAX_RETRIES - 1:
                 await asyncio.sleep(1)
                 continue
-            return {}
+            return _search_failure("timeout")
 
         except httpx.HTTPStatusError as e:
-            logger.error("Serper HTTP error %d for '%s': %s", e.response.status_code, query[:50], e)
+            logger.error("Serper search failed (http_error; HTTP %d)", e.response.status_code)
             record_api_request("serper", requests=0, errors=1)
-            return {}
+            return _search_failure("http_error", e.response.status_code)
 
-        except Exception as e:
-            logger.error("Serper unexpected error for '%s': %s", query[:50], e)
+        except httpx.RequestError:
+            logger.error("Serper search failed (transport_error)")
             record_api_request("serper", requests=0, errors=1)
-            return {}
+            return _search_failure("transport_error")
 
-    logger.error("Serper search exhausted retries for '%s'", query[:50])
-    return {}
+        except Exception:
+            logger.error("Serper search failed (unexpected_error)")
+            record_api_request("serper", requests=0, errors=1)
+            return _search_failure("unexpected_error")
+
+    logger.error("Serper search exhausted retries")
+    return last_failure
 
 
 def _format_results(data: dict, max_organic: int | None = None) -> str:
@@ -371,6 +453,8 @@ def _format_results(data: dict, max_organic: int | None = None) -> str:
     honour the caller's requested ``num_results`` after the upstream call was
     widened to a cache-friendly bucket (see :func:`raw_web_search`).
     """
+    if SEARCH_ERROR_KEY in data:
+        return _format_search_error(data)
     parts = []
 
     # Answer Box (direct answer — highest priority)
@@ -512,7 +596,7 @@ def _format_parallel_query_results(
     blocks: list[str] = []
     for query, data in zip(queries, datas, strict=False):
         if not data:
-            blocks.append(f"## Query: {query}\n\nNo results (error or empty).")
+            blocks.append(f"## Query: {query}\n\nNo results found.")
             continue
         organic = _dedupe_display_organic(
             data.get("organic") or [], seen_urls, max_results,
@@ -549,8 +633,8 @@ async def _run_parallel_queries(
     seen_urls: set[str] = set()
     blocks: list[str] = []
     for q, data in zip(queries, datas, strict=False):
-        if isinstance(data, BaseException) or not data:
-            blocks.append(f"## Query: {q}\n\nNo results (error or empty).")
+        if isinstance(data, BaseException):
+            blocks.append(f"## Query: {q}\n\n{_format_search_error(_search_failure('unexpected_error'))}")
             continue
         deduped = _dedupe_display_organic(data.get("organic") or [], seen_urls, num_results)
         blocks.append(

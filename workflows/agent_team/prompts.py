@@ -867,7 +867,9 @@ Run this loop until every sub-question is corroborated and your answer survives 
 5. Verify, then finish. Before you finish (end a turn with your plain-text answer), spawn a final_verifier that re-derives the answer with DIFFERENT queries and checks every atom (number, date, name, formula). Finish only when it confirms; if it finds a flaw, repair that sub-question and re-verify. Finishing after a couple of turns is the failure mode to avoid."""
 
 
-def render_team_effort(effort: str | None = None) -> str:
+def render_team_effort(
+    effort: str | None = None, *, progressive_research_v1: bool = False,
+) -> str:
     """Return the ``<team_effort>`` tag that ends the system prompt (the ``max`` tier prepends a strategy block).
 
     This controls agent-team's **orchestration intensity** (number of sub-agents, step
@@ -883,10 +885,13 @@ def render_team_effort(effort: str | None = None) -> str:
     The ``<team_effort>`` tag is always the last line of the system prompt, so its byte
     position stays stable when this moves to
     a chat template.
+
+    Progressive research supplies its own strategy and emits only the tag,
+    preserving the configured effort without reintroducing mandatory fan-out.
     """
     value = effort if effort in ("high", "max") else "high"
     tag = f"\n\n<team_effort>{value}</team_effort>"
-    if value == "max":
+    if value == "max" and not progressive_research_v1:
         return f"\n\n{_MAX_EFFORT_POLICY}{tag}"
     return tag
 
@@ -962,6 +967,183 @@ manifest. You do not write or move files yourself.
 """
 
 
+_PROGRESSIVE_RESEARCH = """
+# PROGRESSIVE RESEARCH V1
+
+You are the main research agent. Begin by investigating the original question
+yourself with your available research tools, retaining source URLs, quotations,
+the specific requirement each source supports, and any unresolved conflict.
+Keep the same question and evidence throughout; delegating a gap must not restart
+the whole problem. Direct research and helper reports enter the same saved
+convergence evidence state. A valid citation alone does not prove that a source
+supports the right person, object, event, relationship or date.
+
+Use `review_research` for the existing sufficiency decision: compare the evidence
+with EVERY requirement in the original question. Use actual saved receipt IDs in
+`receipt_ids`. If sufficient, choose `action="finalize"` and provide the complete
+sourced `final_answer`; stop further research. No helper or independent checker
+is required to finish. Do not demand a second source or disproof of every rival
+when the original question and the retrieved evidence do not require it.
+If material is missing, choose `action="continue"`, state concrete `gaps` and
+substantive `blocking_evidence`, and work only on those gaps. Resolve any received
+conflict explicitly. Unfinished helper work alone is not missing evidence.
+
+Reassess strategy after {review_after_main_turns} effective main decision turns,
+or after {no_progress_cycles} complete search-and-read cycles with no new useful
+support or conflict resolution. These are experimental soft checkpoints, not
+automatic escalation, refusal or proof that a question is difficult. A transport
+error, blocked page or failed extraction is a technical failure, not evidence
+against a candidate and not a completed no-progress cycle. Use the existing
+bounded recovery path or another accessible source; do not change model, retry,
+timeout or token budgets.
+
+For one concrete evidence gap, continue targeted research yourself or use at most
+{max_helpers_single_gap} helper. Only when at least two independent gaps can be
+researched separately may you use up to {max_helpers_parallel} helpers in parallel.
+These are ceilings, not staffing targets; active and queued work both consume
+capacity. Before dispatch, register focused `gap_tasks` in `review_research`:
+each has `gap_id`, `requirement`, `subject`, `question`, `source_receipt_ids` and
+`depends_on`. Cite only real saved receipts. Pass the approved `gap_id` in each
+`assign_task` item. A dependent gap waits until its prerequisites are resolved.
+Ask a helper only for its assigned missing evidence and source locations; attach
+the relevant existing evidence instead of sending the entire question to be
+solved again. Collect actual reports when ready, then reassess sufficiency.
+
+The task board still records genuinely outstanding commitments. Update resolved
+items and explicitly cancel work that is no longer needed before finishing.
+Finalization freezes new research and cancels remaining work through the existing
+run controller. It is your evidence-based judgment, not an extra model judge.
+"""
+
+_TIERED_RESEARCH = """
+# TIERED RESEARCH
+
+You are the light path of a two-tier system. Finish here when the evidence is
+sufficient. Hand a question to the full research team rather than guess.
+
+To finish, call `review_research` with `action="finalize"` and `requirements`:
+rows that together cover the original question, including what it asks for.
+Each row has `question_span` (words copied verbatim from the question, one
+condition, at most {max_requirement_words} words), `receipt_id` (a saved receipt
+supporting that condition) and `evidence_quote` (a passage copied verbatim from
+that receipt). The runtime checks that the spans cover at least
+{min_question_coverage_pct}% of the question's content words and that each quote
+occurs in a saved receipt. Copy a quote exactly and stop where the receipt text
+stops: a snippet ending in ... ends there, so never complete it. A search result
+snippet is an acceptable receipt when it states the fact, so do not open more
+pages only to fill a row. A rejection lists the uncovered parts: research them,
+delegate them as gaps, or escalate.
+These checks show traceability, not truth; never cite a passage that does not
+support its condition.
+
+Use `action="escalate"`, with the reason in `disposition` and the open conditions
+in `gaps`, when progress needs several candidates or directions investigated in
+parallel, or the sources you need cannot be reached. Escalating is not failure.
+After {escalate_after_gate_rejections} rejected finalizations or
+{escalate_after_main_turns} effective turns the runtime escalates automatically
+and passes your saved evidence to the team. Helpers share your budget: after
+{light_soft_calls} model calls and page reads no new helper can start, and at
+{light_hard_calls} the runtime escalates. Do not look for a benchmark's or
+evaluation's answer to this question; use independent factual sources.
+"""
+
+_TIERED_ANSWER_CHAIN = """
+# TIERED RESEARCH
+
+You are the light path of a tiered system. Finish here as soon as the evidence
+identifies the answer.
+
+To finish, call `review_research` with `action="finalize"` and `requirements`:
+rows that trace what the question asks for and each link that leads to the
+answer. Each row has `question_span` (words copied verbatim from the question,
+one condition, at most {max_requirement_words} words), `receipt_id` (a saved
+receipt supporting that condition) and `evidence_quote` (a passage copied
+verbatim from that receipt). The runtime checks that the spans cover at least
+{min_ask_coverage_pct}% of the sentence that asks the question and at least
+{min_question_coverage_pct}% of the question's content words, and that each
+quote occurs in a saved receipt. Copy a quote exactly and stop where the receipt
+text stops: a snippet ending in ... ends there, so never complete it. A search
+result snippet is an acceptable receipt when it states the fact, so do not open
+more pages only to fill a row. A rejection lists the uncovered parts.
+These checks show traceability, not truth; never cite a passage that does not
+support its condition.
+
+Background clues that do not change which answer is right need no row. Once the
+evidence identifies the answer, do not hunt for the source of such a clue: the
+final answer lists uncovered parts as unverified, and that is acceptable. A clue
+that separates the answer from another candidate is a link and needs a row.
+
+Before you have evidence, describe what you are looking for in general terms and
+write no named candidate into your plan or tasks unless the question names it. A
+clue often fits several candidates, so search its description first. If searches
+for one candidate return nothing, try another candidate instead of rewording.
+
+You have {max_search_queries} search queries, shared with helpers, and each entry
+in a multi-query search counts as one. When they are used, read the known URLs
+that matter and finalize. Helpers share your budget: after {light_soft_calls}
+model calls and page reads no new helper can start, and at {light_hard_calls}
+research stops. Research also stops after {escalate_after_gate_rejections}
+rejected finalizations or {escalate_after_main_turns} effective turns. When it
+stops the runtime reports the best answer the saved evidence supports, marked as
+unverified. Use `action="escalate"`, with the reason in `disposition` and the
+open conditions in `gaps`, when the sources you need cannot be reached. Do not
+look for a benchmark's or evaluation's answer to this question; use independent
+factual sources.
+"""
+
+_PROGRESSIVE_PLANNING = """
+# Planning Mode (ENABLED)
+While this phase is active, inspect the question and available input with the
+allowed read-only tools, register a concise task board with `add_task`, then call
+`finish_planning`. Do not submit an answer during planning. Once execution is
+unlocked, you may resolve the board through direct research; helpers are optional
+and must target approved evidence gaps. Keep planning bounded by the existing
+planning-turn budget.
+"""
+
+_PROGRESSIVE_FS_GUIDE = """
+
+# Scientific Problem-Solving Guide
+Locate and read the relevant original paper or data with your available tools.
+Address every requested sub-question with exact names, numbers, formulas and
+standard identifiers as applicable. Show intermediate derivation steps when the
+question requires a derivation. Preserve source locations and distinguish
+retrieved facts from inference and unresolved evidence.
+"""
+
+
+def _render_progressive_main_tools(
+    tool_names: list[str] | tuple[str, ...], *, show_finish_planning: bool,
+) -> str:
+    names = tuple(dict.fromkeys(str(name) for name in tool_names if name))
+    available = ", ".join(f"`{name}`" for name in names) or "use the supplied tool schemas"
+    out = f"# Available Tools\n\nMain-agent tools: {available}.\n"
+    if "web_search" in names:
+        out += "Use `web_search` to locate candidate sources and narrow evidence gaps.\n"
+    if "web_fetch" in names:
+        out += (
+            "Read web pages directly with `web_fetch`, using a focused extraction request. "
+            "Retain the exact URL and source passage; snippets are leads when the "
+            "question requires evidence from the page itself.\n"
+        )
+    if "download_file" in names:
+        out += (
+            "Use `download_file` for binary documents or data requiring local inspection; "
+            "inspect them with the available file tools, or delegate a specific operation "
+            "that your tools cannot perform.\n"
+        )
+    out += (
+        "`review_research` exposes the same saved evidence and finalization decision "
+        "used for helper reports. Use only tool capabilities actually supplied. "
+        "Keep source URLs character-for-character as returned by tools. "
+        "When delivering a final answer, provide the complete sourced answer in plain "
+        "text or through the accepted review finalization path.\n"
+    )
+    if show_finish_planning:
+        out += "Call `finish_planning` to leave the read-only planning phase.\n"
+    return out
+
+
 def get_main_system_prompt(
     date_str: str,
     fs_mode: bool = False,
@@ -972,6 +1154,9 @@ def get_main_system_prompt(
     mcp_tool_names: list[str] | tuple[str, ...] = (),
     mcp_tool_specs: list[dict] | tuple[dict, ...] = (),
     document_toolchain_note: str = "",
+    progressive_research_v1: bool = False,
+    main_agent_tools: list[str] | tuple[str, ...] = (),
+    progressive_config: dict | None = None,
 ) -> str:
     """Build the full main agent system prompt.
 
@@ -985,6 +1170,10 @@ def get_main_system_prompt(
             Empty → a sensible default phrase (see ``_SUB_CAPS_FALLBACK``).
         document_toolchain_note: Runtime-discovered Node document capability
             for the sub-agent environment. Empty when unavailable.
+        progressive_research_v1: Explicit opt-in to direct main-agent research
+            and targeted helpers; default prompt bytes remain unchanged.
+        main_agent_tools: Actual resolved main tools for the progressive prompt.
+        progressive_config: The run's experimental checkpoint/helper controls.
         planning_mode: Only consulted when ``phase == "combined"``. If True,
             prepend the Planning Mode gate notice (the task board is always
             present regardless).
@@ -1009,7 +1198,28 @@ def get_main_system_prompt(
     # so it applies in every mode. Planning additionally prepends the gated
     # _PLANNING_MODE_CLAUSE; the fresh-context execution loop prepends
     # _EXECUTION_CLAUSE.
-    if phase == "planning":
+    if progressive_research_v1:
+        controls = {
+            "review_after_main_turns": 6,
+            "no_progress_cycles": 2,
+            "max_helpers_single_gap": 1,
+            "max_helpers_parallel": 2,
+        }
+        controls.update({key: value for key, value in (progressive_config or {}).items()
+                         if key in controls})
+        show_finish_planning = phase == "planning" or (phase == "combined" and planning_mode)
+        team_section = _PROGRESSIVE_RESEARCH.format(**controls)
+        if (progressive_config or {}).get("tiered_escalation"):
+            from workflows.agent_team.progressive import TIER_DEFAULTS
+
+            template = (_TIERED_ANSWER_CHAIN if progressive_config.get("answer_chain_gate")
+                        else _TIERED_RESEARCH)
+            team_section += template.format(**{**TIER_DEFAULTS, **progressive_config})
+        if show_finish_planning:
+            team_section = _PROGRESSIVE_PLANNING + team_section
+        elif phase == "execution":
+            team_section = "\nPlanning is complete; continue from the supplied task board and evidence.\n" + team_section
+    elif phase == "planning":
         team_section = _PLANNING_MODE_CLAUSE
         show_finish_planning = True
     elif phase == "execution":
@@ -1026,12 +1236,16 @@ def get_main_system_prompt(
     main_web_search = planning_mode or phase in ("planning", "execution")
     prompt = ENHANCED_PROMPT.format(
         date=date_str,
-        tools=_render_tools_main(show_finish_planning, main_web_search, sub_agent_tools),
+        tools=(
+            _render_progressive_main_tools(main_agent_tools, show_finish_planning=show_finish_planning)
+            if progressive_research_v1 else
+            _render_tools_main(show_finish_planning, main_web_search, sub_agent_tools)
+        ),
         team_management=team_section,
     )
     prompt += SEARCH_QUERY_LANGUAGE_NOTE
     if fs_mode:
-        prompt += FS_PROBLEM_GUIDE
+        prompt += _PROGRESSIVE_FS_GUIDE if progressive_research_v1 else FS_PROBLEM_GUIDE
     prompt += CHART_NOTE
     prompt += document_toolchain_note
     prompt += render_client_mcp_tools_section(mcp_tool_names, mcp_tool_specs)

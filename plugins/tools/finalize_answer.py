@@ -40,7 +40,9 @@ def finalize_gate(
     Checks (in order): empty answer (blocks) · sub-agents created but never
     assigned (WARN-only, never blocks) · task-board items still open/in_progress
     (blocks) · (Planning Mode only) solo submission (blocks) · (Planning Mode
-    only) answer not independently verified (blocks). The board / planning
+    only) answer not independently verified (blocks). Opt-in progressive
+    research permits a sourced solo answer without a verifier; it retains the
+    empty-answer, outstanding-board and active-planning checks. The board / planning
     checks are no-ops outside agent-team (no board → no pending items; planning
     checks gated on ``planning_enabled``).
     """
@@ -69,8 +71,19 @@ def finalize_gate(
         planning_enabled,
         unresolved_task_ids,
     )
+    from workflows.agent_team.convergence import current_convergence
+
+    convergence = current_convergence()
+    progressive = getattr(convergence, "progressive", None) is not None
     pending = unresolved_task_ids(task_id)
     if pending:
+        if progressive:
+            return (
+                f"Cannot finish: task board has unresolved item(s) {pending}. For "
+                "each, call update_task(id, resolution='resolved') once the "
+                "original requirement is supported, or resolution='cancelled' "
+                "if no longer needed — then deliver your answer."
+            )
         return (
             f"Cannot finish: task board has unresolved item(s) {pending}. For "
             "each, call update_task(id, resolution='resolved') once it is "
@@ -78,12 +91,18 @@ def finalize_gate(
             "needed — then deliver your answer."
         )
     if in_planning(task_id):
+        if progressive:
+            return (
+                "Cannot finish: you are still in PLANNING MODE. Register the "
+                "concise task board and call finish_planning to start execution; "
+                "you cannot submit an answer during planning."
+            )
         return (
             "Cannot finish: you are still in PLANNING MODE. Decompose the "
             "question into the task board, then call finish_planning to start "
             "the team — you cannot submit an answer during planning."
         )
-    if planning_enabled(task_id):
+    if planning_enabled(task_id) and not progressive:
         bus = registry.get_optional(AgentBus)
         sessions = bus.list_sessions_for_task(agent_bus_task_id) if bus else []
         worked = [s for s in sessions if getattr(s, "total_task_count", 0) > 0]

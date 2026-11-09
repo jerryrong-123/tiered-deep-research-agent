@@ -29,9 +29,14 @@ class AutoFanInObserver(BaseObserver):
         if bus is None:
             return None
 
+        from workflows.agent_team.convergence import current_convergence
+
+        convergence = current_convergence()
+        bus_task_id = convergence.bus_task_id if convergence is not None else ctx.task_id
+
         collected: list[tuple[str, SubAgentResult]] = []
         while True:
-            ready = await bus.wait_any_session(ctx.task_id, timeout=0.0)
+            ready = await bus.wait_any_session(bus_task_id, timeout=0.0)
             if ready is None:
                 break
             collected.append(ready)
@@ -39,9 +44,11 @@ class AutoFanInObserver(BaseObserver):
         if not collected:
             return None
 
-        batch = process_collected(bus, ctx.task_id, collected)
+        if convergence is not None:
+            convergence.observe_reports(collected)
+        batch = process_collected(bus, bus_task_id, collected)
         status = format_status_line(
-            bus, ctx.task_id,
+            bus, bus_task_id,
             paused_names=batch.paused_names,
             incomplete_count=batch.incomplete_count,
         )

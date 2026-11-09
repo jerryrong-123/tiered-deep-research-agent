@@ -582,6 +582,13 @@ async def assign_task(tasks: list[AssignmentSpec] | str = "") -> str:
             )
             continue
 
+        # The opt-in native scheduler binds the factual gap at its guarded
+        # admission boundary. Preserve it in the REAL running/queued job so
+        # limits cannot be bypassed by changing session names or queueing.
+        from workflows.agent_team.progressive import assignment_metadata
+
+        task_metadata.update(assignment_metadata(agent_name))
+
         # Expand any cross-agent <attach agent="..."/> tags before
         # dispatch so the sub-agent sees the actual report text.
         expanded_prompt = _expand_attach_tags(

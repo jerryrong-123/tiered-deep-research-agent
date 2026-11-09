@@ -317,6 +317,13 @@ async def collect_reports(timeout: int = 1800) -> str:
         )
 
     _reset_status_churn(scope)
+    # Receipt bookkeeping is separate from semantic sufficiency. Keep the exact
+    # native reports; the next existing coordinator turn decides what is missing.
+    from workflows.agent_team.convergence import current_convergence
+
+    convergence = current_convergence()
+    if convergence is not None:
+        convergence.observe_reports(collected)
     batch = process_collected(bus, task_id, collected)
     status = format_status_line(
         bus, task_id,
@@ -328,6 +335,8 @@ async def collect_reports(timeout: int = 1800) -> str:
             f" harvested={batch.evidence_count} evidence "
             f"+ {batch.assertion_count} assertions"
         )
+    if convergence is not None and convergence.phase == "review_required":
+        status += "\n" + convergence.render_review_message()
     return "\n\n".join([*batch.blocks, status])
 
 

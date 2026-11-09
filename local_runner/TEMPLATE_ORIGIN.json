@@ -1,0 +1,19 @@
+{
+  "adapter_version": "native_local_runner_v1",
+  "origin": "outputs/frontier_two_case_trial_20261030_01/trial_0810 (local run directory; absolute path removed, not included)",
+  "original_files_sha256": {
+    "run_native.py": "debcbd750fe74c9e59b0dd7045110d6b00332215a9f0d8016fda6aecc240df24",
+    "trial_helpers.py": "c3414cd0d2c4d37a7c0a38271694916b35f71fa0353c6bd89f32682f18473474",
+    "budget_adapter.py": "c5959a948dfabd149347115069ec34018e558db97b7e965b440ba3cd03d10da8",
+    "task_supervisor.py": "cd2f68510f95511559308c0a46758aa342b612a4cda2b690c51d0665abea5974",
+    "answer_label_guard.py": "333946f4fbe6aca66c89e3012857be5f498dddad162dfc64400e85ef8e0d924d",
+    "PROFILE.yaml": "672ea44641fb7c9f7ed8248ca3dddfa2ed214f0ec5a6dde982eaebecba1d30df",
+    "launch.ps1": "b3b81675b66a72cee1c13326b930b25d70f559f473b381322cfe88de918b4510",
+    "test_native.py": "9be4a56207a8d973ec0bce4008cedd435d18507d61924a531e7885ec44cda8c4",
+    "test_linux_adapter.py": "5ce993cae680ecd1480d04b42a0df7fcd99d8c4c2a2182f52a5237a5995eae44",
+    "test_budget_adapter.py": "549cd65e34716371e07a0b364be2e6cf368b006976bd29a30e21d823df85e91a",
+    "test_verified_pricing.py": "da39b51c9fb05ecc64a84523f7491855a1c66b83a9b34d724208ed5242437801",
+    "PRICING_VERIFICATION.json": "252e79e28427689fca99933edd93b33a8a814d595e33acf5c050c7ecaa372260"
+  },
+  "scope": "Only adapter source/config/tests copied; no question, answer, trajectory, ledger or credentials"
+}
