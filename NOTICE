@@ -1,0 +1,28 @@
+Tiered Deep Research Agent
+
+This project is derived from FrontierAgent, maintained by ApodexAI and its
+contributors:
+https://github.com/ApodexAI/FrontierAgent
+
+Upstream source reference:
+e4cb2397109c957a2f99c3a5d850b9fc479dbef6
+
+The upstream Apache License, Version 2.0, is retained in LICENSE. Existing
+copyright and attribution notices in retained upstream source files remain
+applicable. An upstream project description is retained in
+docs/UPSTREAM_README.md.
+
+This derivative adds or modifies tiered research routing, evidence and answer
+checks, progressive delegation, convergence control, local execution adapters,
+budget accounting, source guards, diagnostics, tests, and release documentation.
+See MODIFICATIONS.md for the change inventory.
+
+The release history is sanitized to exclude benchmark question text, reference
+answers, run trajectories, grading outputs, credentials, and private local
+artifacts. The upstream reference above identifies provenance; sanitized
+history must not be represented as a byte-for-byte reproduction of every
+upstream artifact or as unchanged upstream history.
+
+FrontierAgent and Apodex names are used only for attribution. No trademark
+rights or upstream endorsement of this derivative or its reported results are
+claimed.

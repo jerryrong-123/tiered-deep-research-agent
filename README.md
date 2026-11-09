@@ -1,430 +1,215 @@
-<div align="center">
-  <picture>
-    <img src="./assets/apodex_logo.jpeg" width="30%" alt="Apodex">
-  </picture>
-</div>
-<hr>
-<br>
+# Tiered Deep Research Agent
 
-<div align="center">
-  <a href="https://www.apodex.ai"><img alt="Online Service" src="https://img.shields.io/badge/🤖%20Online_Service-Apodex_1.1-1783ff"/></a>
-  <a href="https://www.apodex.com/"><img alt="Homepage" src="https://img.shields.io/badge/Homepage-Apodex_AI-white"/></a>
-  <a href="https://platform.apodex.ai"><img alt="Try Apodex API" src="https://img.shields.io/badge/Try_Apodex_1.1-API_Platform-1783ff"/></a>
-  <br>
-  <a href="https://huggingface.co/collections/apodex"><img alt="Hugging Face" src="https://img.shields.io/badge/🤗%20Hugging_Face-Apodex_AI-ffc107"/></a>
-  <a href="https://discord.gg/TDJA59TCng"><img alt="Discord" src="https://img.shields.io/badge/Discord-Apodex_AI-5865F2"/></a>
-  <a href="https://x.com/Apodex_AI"><img alt="X" src="https://img.shields.io/badge/X-@Apodex__AI-000000?logo=x&logoColor=white"/></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue"/></a>
-</div>
-<br>
-<p align="center">
-  <a href="https://trendshift.io/repositories/182526?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-182526" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/182526/daily?language=Python" alt="ApodexAI%2FFrontierAgent | Trendshift" width="250" height="55"/></a>
-</p>
-<p align="center">
-  <b><a href="https://www.apodex.com/blog/apodex-1.1-scaling-agentic-intelligence-for-complex-work">Tech Blog</a></b> ·
-  <b><a href="https://arxiv.org/abs/2608.23283">Tech Report</a></b>
-</p>
+A tiered research agent derived from [FrontierAgent](https://github.com/ApodexAI/FrontierAgent), with evidence-based escalation, independent answer checks, bounded spending, and optional multi-agent research. This repository contains source code and configuration, not benchmark questions, reference answers, or run artifacts. Reported results are scoped to the specific evaluations described below.
 
-# FrontierAgent
+## 项目简介
 
-FrontierAgent is an open-source agent runtime, terminal product, and evaluation
-suite for long-horizon research and file-based work. The `frontier-agent` TUI
-ships two native workflows:
+本项目基于 FrontierAgent 二次开发，面向需要多轮搜索、阅读和关联证据的深度研究任务。上游基准为 `e4cb2397109c957a2f99c3a5d850b9fc479dbef6`。本项目保留其智能体运行框架、工具与 Agent Team 能力，增加分层路由、证据门禁、独立核查、按需委派、收敛控制、费用记录和来源防泄露守卫。
 
-- **ReAct** — one stateful agent researches, reads files, writes deliverables,
-  runs commands, and iterates in a task-scoped sandbox.
-- **Agent Team** — a coordinator maintains a task board, delegates independent
-  work to parallel sub-agents, collects their reports, and synthesizes the result.
+这里的“分层”由本次运行的证据状态决定，不预先按题号分配模型：先用 DeepSeek Flash 研究，未核实的答案再交给 DeepSeek Pro 独立研究；Agent Team 是显式启用的可选后备层。搜索使用 Serper，读页使用 Jina，沙箱使用 E2B。
 
-The same workflow engine powers the benchmark runner used to evaluate Apodex
-models. The framework, tools, workflows, and evaluation layer remain separate,
-so each can be reused independently.
+两个版本标签分别保留开发结果对应代码与后续实现：
 
-> [!IMPORTANT]
-> ### 🚀 Try FrontierAgent on the Apodex API — free for the next two weeks!
->
-> **No model hosting required.** Get an API key, connect to the OpenAI-compatible
-> Apodex-1.1 endpoint, and start running FrontierAgent in minutes.
->
-> **[→ Start building for free at platform.apodex.ai](https://platform.apodex.ai/)**
->
-> ⏳ This is a limited-time offer—come try it and let us know what you build!
+- `v2.3.2-dev30`：下文 DEV30 主结果对应的 V2.3.2 代码。
+- `v2.6.1-guard-v8`：V2.6.1 与防泄露守卫 v8；不能用它的名称重新标注 V2.3.2 的历史成绩。
 
-New here? Use the **[documentation index](docs/README.md)** to find the right
-installation, SGLang, workflow, evaluation, or developer guide.
-
-<p align="center">
-  <img src="./assets/apodex1.1_bench.png" alt="Apodex-1.1 benchmark results across professional work, finance, scientific research, and general reasoning tasks" width="900"/>
-</p>
-
-## Highlights
-
-- **Native Agent Team workflow.** The coordinator decomposes the request,
-  dispatches bounded parallel assignments, receives structured reports, and can
-  use an optional fast reporter for final evidence review.
-- **Task Board.** Agent Team's `add_task` and `update_task` events appear live in
-  the TUI sidebar with pending, active, completed, blocked, and cancelled state.
-- **Sandboxed file work.** Shell and file tools share one task-scoped filesystem:
-  `/inputs` is read-only, `/workspace` is working state, and `/outputs` contains
-  persistent deliverables. Authorization and sandbox failures are fail-closed.
-- **Asynchronous intervention.** Type while an agent is running to queue a new
-  instruction. It is injected at the next safe turn boundary without discarding
-  the active run. In Agent Team mode it steers the coordinator; already-running
-  sub-agents are allowed to finish.
-- **Transparent deliverables.** On macOS/Docker, `/outputs` maps to
-  `.apodex/runs/<session-id>/outputs` on the host. The same run directory also
-  contains its checkpoint, trace, engine log, and trajectories.
-- **Approval, trace, and recovery.** Mutating operations show a diff and require
-  approval unless `--yes` is enabled. Sessions are checkpointed, every action is
-  traced locally, `/revert` restores session changes, and `--resume` continues a
-  saved run.
-- **Evaluation included.** The subprocess runner supports research and
-  file-grounded benchmarks, deterministic artifact collection, concurrency,
-  progress inspection, and rerunning individual failures.
-
-<p align="center">
-  <img src="./assets/agent_team.png" alt="Conceptual Agent Team workflow: a main agent assigns work to expert sub-agents, collects asynchronous reports, requests verification when needed, and synthesizes the final report" width="900"/>
-</p>
-
-<p align="center"><em>Conceptual Agent Team workflow, from task delegation and asynchronous report collection to verification and final synthesis.</em></p>
-
-## How it fits together
+## 架构
 
 ```mermaid
-flowchart LR
-    U["User / benchmark task"] --> TUI["TUI or subprocess runner"]
-    TUI --> R["Stateful ReAct"]
-    TUI --> C["Agent Team coordinator"]
-    C --> B["Task board"]
-    B --> S1["Sub-agent 1"]
-    B --> S2["Sub-agent 2"]
-    B --> SN["Sub-agent N"]
-    R --> FS["Task sandbox"]
-    S1 --> FS
-    S2 --> FS
-    SN --> FS
-    FS --> I["/inputs (read-only)"]
-    FS --> W["/workspace (working files)"]
-    FS --> O["/outputs (deliverables)"]
-    S1 --> C
-    S2 --> C
-    SN --> C
-    C --> A["Final answer / report"]
-    R --> A
+flowchart TD
+    Q[自有题目：题号、原文、哈希] --> F[Flash 搜索与阅读]
+    F --> E[引用与答案链门禁／停下时综合已有证据]
+    E --> C[独立核查]
+    C -->|supported| A[保留答案并结束]
+    C -->|未核实、无答案或技术失败| P[Pro 独立研究与核查]
+    P -->|supported| A
+    P -->|仍未核实| O{是否启用后备层}
+    O -->|否| S[保留当前最可信答案及状态]
+    O -->|with-fat| T[Agent Team]
+    T --> S
 ```
 
-The repository boundaries are intentional:
+Flash 与 Pro 的研究上下文隔离，Pro 不接收 Flash 的候选答案。后层结果只有可信度更高才替换先前答案，同级保留较早答案。优先级为：独立核查通过，其次通过门禁或团队给出的答案，再其次强制综合或未核查答案。没有答案时保留明确状态，不把空结果补成“已完成”。这些等级是检查状态，不是正确性的保证。
+
+源码还提供 `--with-graph` 实验后备层，与 `--with-fat` 互斥，默认均关闭。它不属于下文 DEV30 主结果；它的上下文与核验策略也不能套用为 Flash、Pro 的行为说明。
+
+## 核心设计
+
+### 证据门禁与语义核查分工
+
+答案提交时检查引文是否存在于本次有效来源，并核对所问部分与条件的文字追溯覆盖。V2 配置采用所问部分 80%、整题条件 50% 的答案链门禁；它们是试验阈值，计算的是文本覆盖，不代表已经证明相应比例的事实。独立核查另行查看题目、答案和引用原文，判断证据是否支持答案。
+
+研究因预算或其他停止条件结束时，程序从保存的证据中进行一次有界综合；无法支持具体答案时仍保留缺口。引用校验通过不能替代语义判断，独立核查自身也可能判错。
+
+### 按需委派与收敛
+
+`progressive_research_v1` 让主智能体先搜索、读页，再通过 `review_research` 声明需要帮助的具体事实缺口。任务含对象、要求、来源收据和依赖。程序校验结构及引用、检测依赖环，并在覆盖整个入队过程的锁内按活动任务范围去重。
+
+在这个显式配置下，单缺口最多一个助手，至少两个独立未解决缺口才允许最多两个运行或排队中的助手；这不是全项目所有模式的统一并发上限。助手不能递归委派。程序无法保证识别所有语义相同但措辞不同的任务。
+
+最终收敛通过 `review_research(action="finalize")` 冻结新的研究工作，走现有取消与回收路径，并返回答案。待处理的子任务报告与已经声明的实质冲突仍须处理；收到收据只表示收到工具结果，不表示该结果真实。
+
+### 费用与诊断
+
+本地适配器保存来源、引用位置、工具收据、传输阶段和费用账本。模型费用、未知用量的保留金额与外部服务计量应分开理解。每题上限、批次上限、余额底线和错误停止条件共同控制后续工作；批次停止主要阻止新运行启动，已启动运行可能继续收尾。
+
+### 防泄露守卫
+
+v8 在搜索、读页、摘要输入和部分其他工具路径上拦截已知评测来源、题目复述及答案标签信号，并保留拦截记录。它不读取参考答案来路由题目。“未命中这些规则”只说明没有检出所定义信号，不证明运行绝对独立；正常网页也可能被误拦。
+
+实现说明见 [分层规则](local_profiles/TIERED_RESEARCH_V2.md)、[按需委派](local_profiles/PROGRESSIVE_RESEARCH_V1.md) 和 [本地运行适配器](local_runner/README.md)。其中对历史 `outputs/` 文件的引用是开发记录索引，这些运行文件不随仓库发布。
+
+## 结果
+
+### DEV30：归档中的开发对照
+
+DEV30 是 BrowseComp 的 30 题开发子集。使用冻结模板的 LLM 判分器，每题一次、不重试；另对名称写法做裁定。以下来自发布材料列明的历史结果，不是本次发布过程中重新跑出的成绩。
+
+| 配置 | 冻结判分 | 名称写法裁定后 | 无答案题 |
+|---|---:|---:|---:|
+| 基线：DeepSeek Pro + Serper，单次运行 | 21/30 | 22/30 | 3 |
+| 分层 V2.3.2：Flash → Pro | 25/30 | 26/30 | 0 |
+
+与基线比较，改进版多答对 7 题，同时丢失 3 题，净增加 4 题。30 题中 21 题通过独立核查，其中 19 题正确，约 90%；Flash 层核查通过的 16 题均正确，约一半的题在 Flash 层核实结束。独立核查通过与最终判对不是同一件事。
+
+第一版分层系统加上 Pro 后仍有 7 题无答案。改用上述答案链门禁，并在研究停止时综合已有证据后，无答案题降至 0。无答案减少不能单独证明正确率提升。
+
+### 另选 200 题：作者报告的补充验证
+
+项目作者确认：从题集中排除前述 DEV30 后，另选同一组 200 题，基线与改进版都实际运行，并使用相同判分标准。作者报告的名称等价写法裁定后结果为：
+
+| 配置 | 名称等价写法裁定后 | 比例 |
+|---|---:|---:|
+| 基线 | 147/200 | 73.5% |
+| 改进版 | 174/200 | 87.0% |
+
+两者相差 13.5 个百分点。裁定接受指向同一实际对象的缩写、昵称、头衔、全名等表达差异；仅与该对象有关联，或实际指向另一个对象，不算等价。这些是裁定后的成绩，不是冻结模型判分器直接输出的原始计数。
+
+这组数字由项目作者提供并确认。当前发布材料没有完整的 200 题逐题记录，本次发布核查没有独立重算；也没有将其绑定到某个尚未核实的代码标签、模型配置或防泄露版本。它与 DEV30 分开报告，不合并总分，不把 DEV30 的费用、无答案数量或泄露审计结论迁移到这 200 题上。排除 DEV30 本身也不证明这组题在全部开发过程中从未被使用。
+
+### Agent Team：单独的小样本对照
+
+在 DeepSeek Flash 上，原版 Agent Team 与 convergence v1 各运行 7 次，覆盖 5 道不同题目：
+
+| 指标 | 原版 Agent Team | convergence v1 |
+|---|---:|---:|
+| 完成任务 | 3/7 | 7/7 |
+| 技术失败 | 4 | 0 |
+| 判对 | 1/7 | 5/7 |
+
+最难的两道题上，每个正确答案的成本从 ¥31.5 降至 ¥7.5。同一道题、两者均答对的单次比较中，按需委派 progressive research v1 相比 convergence v1：模型调用 231 → 11，token 509 万 → 21 万，耗时 1,154 s → 103 s，成本 ¥2.26 → ¥0.18。
+
+这组数据属于独立对照，不能计入 DEV30 成绩，也不能推广为全部题目的速度或成本收益。
+
+## 成本
+
+| 口径 | 金额 |
+|---|---:|
+| V2.3.2 DEV30 这一列实际花费 | 约 ¥56 |
+| 每题平均 | 约 ¥1.9 |
+| 按裁定后 26 题计算，每答对一题 | 约 ¥2.1 |
+| 基线按发布材料所用价格重算 | 约 ¥12.7 |
+| 基线每答对一题 | 约 ¥0.58 |
+
+**分层版每答对一题的成本约为基线的 3.7 倍。** 基线金额是按发布材料价格重新估算，不是原始实付，也不是对当前服务价格的承诺。准确率对照和成本对照必须同时看。
+
+Flash 每次运行的账本平均 ¥1.09，约为 Pro（¥3.08）的三分之一。账本为保守估算；历史运行仅在优惠时段进行时，实际花费约为账本的 55%，这一比例不能直接用于未来运行。每题硬上限、每批总额上限和余额底线仍须设置。Serper、Jina 与 E2B 的费用或额度不应当作模型费用混算。
+
+## 局限
+
+- 可从本次归档材料核对的主对照只有 DEV30 这 30 题，大多为单次运行；同题重复运行的结果会变化。200 题是另列的作者报告，缺少完整逐题记录供本次发布独立重算，不能弥补这个证据范围差异。
+- 26/30 对应的分层列没有启用 Agent Team。团队的结果来自单独对照，不能合并宣传。
+- 部分历史运行接触过评测相关来源，泄露审计为 `exposed` 或“无法判断”。例如 0007 没有一次运行被判为 `clean`；不能将全部成绩称为已排除泄露的独立作答成绩。
+- 防泄露守卫 v8 在 V2.3.2 之后加入。V2.3.2 成绩并非在 v8 下测得；v8 的拦截也可能漏检或误拦。
+- 冻结判分器每题只调用一次、不重试，模型判分可能不稳定。名称写法裁定另列，不能覆盖原始布尔值，也不能把裁定后结果冒充原判分。
+- 引文存在、文本覆盖达标、独立检查返回 `supported` 均不能保证答案正确；后续层也可能引入错误。
+- 门禁、任务调度及预算参数来自有限开发试验，不是普遍适用的难度阈值。服务时变、页面失效、验证页面和余额不足会影响结果。
+- 为避免公开 BrowseComp 的题目和答案，仓库不包含题目原文、参考答案、答卷、运行轨迹或逐题判分结果。不能仅凭本仓库直接复现上述分数；可使用自己的题目验证行为。
+- 发布包中的运行镜像引用属于原机器本地镜像，没有公开分发。运行者需要自行构建镜像，配置服务，并核对当前模型可用性和计价；历史价格核验窗口不会自动延长。
+
+## 运行方式
+
+### 环境与镜像
+
+以下命令在仓库根目录执行。本地适配器面向 Windows PowerShell 与 Docker 的 Linux 容器；代码要求 Python 3.12 或更新版本。Docker 必须有足够资源运行镜像与临时工作区，本项目没有测定通用最低内存要求。外部访问是否需要代理取决于使用者网络，不能从历史机器的设置推导；不要将代理凭据写入仓库。
+
+先使用仓库的 Dockerfile 构建自己的镜像。构建会下载基础镜像和依赖，不属于离线运行：
+
+```powershell
+docker build -t tiered-research-local:release .
+```
+
+`local_runner/launch.ps1` 模板目前引用原机器的本地镜像摘要，该镜像未公开。**在准备试跑目录之前**，将模板中 `dockerArgs` 的镜像项替换为自己构建的 `tiered-research-local:release`，或使用自己镜像的固定 ID。路由器也从此模板生成运行，当前没有 `--image` 参数。仅改某次已生成的脚本不会改变后续路由运行所用的镜像。
+
+`prepare.py` 会把 `__PROJECT_ROOT__` 绑定为当前源码目录的父目录，并把源码挂载路径绑定为当前源码目录；`__DOCKER_EXE__` 会被替换为 `$DockerCommand`，生成脚本默认从 PATH 使用 `docker`，也可用 `-DockerCommand` 指定程序。不要直接执行含占位符的源模板。
+
+### 环境变量与输入
+
+变量名见 [runtime.env.template](local_runner/runtime.env.template)，模板值均为空。当前 launcher 的实际读取位置是：
 
 ```text
-frontier_agent/  generic loop, scheduling, registries, AgentBus, observers
-plugins/tools/   web, shell, file, sandbox, and team tool implementations
-workflows/       ReAct and Agent Team pipelines, profiles, prompts, observers
-apodex/          terminal CLI/TUI, approvals, sessions, traces, and Docker path
-benchmarks/      public harness plus bundled FrontierSearchBench/FrontierChallenge
+<仓库父目录>/outputs/frontier_agent_team_setup_20261027_01/secrets/runtime.env
 ```
 
-More detail: [framework architecture](docs/framework.md),
-[Agent Team](workflows/agent_team/README.md), and
-[Stateful ReAct](workflows/stateful_react_agent/README.md). See
-[run artifacts and timestamps](docs/run-artifacts.md) for the on-disk layout.
+这一位置不是仓库根目录的 `.env`，也不是试跑目录。可将空模板复制到该位置后，在本机编辑；不要提交实际的 `runtime.env`。
 
-## Quick start
+当前本地适配器要求 DeepSeek、Serper、Jina 和 E2B 的凭据。通过 DeepSeek 的 OpenAI 兼容接口运行时，`OPENAI_API_KEY` 与 `DEEPSEEK_API_KEY` 填同一把 DeepSeek 密钥；`OPENAI_MODEL` 使用适配器支持的 `deepseek-flash`，`OPENAI_BASE_URL` 为 `https://api.deepseek.com`，`OPENAI_PROVIDER` 为 `openai`，`SANDBOX_BACKEND` 为 `e2b`。这些是当前代码适配的配置，不能据此断言服务今后仍接受相同模型名。Pro 层由路由器显式覆盖模型；价格与模型兼容性须在实际付费运行前核对。
 
-Requirements: Git, Python 3.12, [uv](https://docs.astral.sh/uv/), and an
-OpenAI-compatible model endpoint. Docker is optional.
+准备自己的问题文件，仅含 `id`、`question`、`question_sha256`。哈希为原始 `question` 字符串 UTF-8 字节的 SHA-256，不额外拼接换行；不要混入参考答案、判分或其他字段。题目文件与输出目录都应放在仓库外。
+
+### 先离线测试单次适配器
+
+下面只生成试跑目录并执行离线检查，不会研究题目：
+
+```powershell
+python local_runner/prepare.py --question-json ..\questions\my-question.json --out ..\runs\progressive-check --profile-file local_profiles/progressive_research_v1.yaml
+powershell -ExecutionPolicy Bypass -File ..\runs\progressive-check\launch.ps1 -Mode test
+```
+
+输出目录必须是新的，且位于源码目录外。准备阶段保存当前源码指纹，不读取历史答卷，也不启动容器或服务调用。生成脚本的 `test` 模式使用 `--network none` 和离线占位值，不加载真实环境文件。源码修改后应重新准备目录，避免与记录的指纹不一致。
+
+完整适配器测试依赖 Linux 容器中的 `/app` 源码路径，以下命令应在该容器内且依赖已安装时运行；`local_runner/test_*.py` 不在项目默认 pytest 收集目录内，需显式包含：
 
 ```bash
-git clone https://github.com/ApodexAI/FrontierAgent.git
-cd FrontierAgent
-
-uv sync --python 3.12 --extra dev
-cp .env.example .env
+python -m pytest tests/test_tiered_router.py tests/test_tiered_research_v1.py tests/test_local_runner_progressive_v1.py local_runner -q
 ```
 
-Add your endpoint to `.env`:
+发布副本已排除上游自带的基准题库、答案和评测展示文件。`tests/test_frontier_search_bench.py` 与 `tests/test_benchmark_layout.py` 的部分检查依赖这些未分发的数据，不能在缺少数据时宣称全量测试通过。上游自动发布、定时任务和原全量 CI 已移至 `.github/disabled-workflows/`，不会自动运行；工作流内容保留供后续审阅。
 
-```dotenv
-OPENAI_API_KEY=your-key
-OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
-OPENAI_MODEL=your-model-name
+测试结果需以本机实际输出为准。不要把命令示例或历史测试数字当作本次通过结果。
 
-# Optional web research tools
-WEB_SEARCH_PROVIDER=serper
-SERPER_API_KEY=
-SERPER_BASE_URL=https://google.serper.dev
-JINA_API_KEY=
+### 分层路由：预览与执行分开
+
+路由器接受只含题目字段的 JSONL，或 `<id>/QUESTION.json` 子目录集合。先输入自己批准的批次账本上限：
+
+```powershell
+$batchBudgetCny = Read-Host '批次模型账本上限（人民币）'
+python local_runner/tiered_router.py --questions ..\questions\own-questions.jsonl --out ..\runs\tiered-trial --max-total-cny $batchBudgetCny --workers 1 --dry-run
 ```
 
-Support any Serper.dev-compatible endpoint (like litescrape.com, serpbase.dev,
-and others) by setting `SERPER_BASE_URL` and a provider-issued `SERPER_API_KEY`.
+`--dry-run` 只校验输入并输出计划，不生成研究结果、不调用模型、不搜索或抓取。确认配置、实际费率与预算之后，去掉 `--dry-run` 才会启动付费研究。默认只有 Flash → Pro；如需团队后备层，显式加 `--with-fat`。`--with-graph` 是另一个实验后备层，不能与 `--with-fat` 同时使用。
 
-Set `WEB_SEARCH_PROVIDER=parallel` to use the free, keyless
-[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) for
-`web_search`. Serper remains the default, so existing keys and missing-key
-errors keep their current behavior. Parallel MCP does not support the tool's
-custom region, language, or time filters, or counts above 10 per query; choose
-Serper when those are needed.
-`web_fetch` continues to use its existing fetch provider.
+单次适配器则通过生成脚本的 `-Mode execute` 开始付费运行；`-Mode cleanup` 可能调用 E2B 清理资源，也不是离线模式。搜索、读页、沙箱及模型分别可能消耗额度。不要把准备成功或离线测试通过视为联网服务可用性的证明。
 
-Start the TUI:
+路由器在相同输出目录下可继续已经记录的批次；已开始的试次不会任意重跑，异常中断的恢复有独立记录。停止原因、未知费用保留金额和已发生费用应保留，不能通过删除记录绕过预算。
 
-```bash
-# Stateful single-agent workflow
-uv run frontier-agent --mode react --cwd /path/to/project
+## 目录结构
 
-# Coordinator plus parallel sub-agents
-uv run frontier-agent --mode agent_team --cwd /path/to/project
-```
+| 目录或文件 | 用途 |
+|---|---|
+| `frontier_agent/`、`apodex/` | 上游运行框架、模型和智能体基础能力 |
+| `workflows/agent_team/` | 团队工作流、收敛与按需研究控制 |
+| `plugins/` | 搜索、阅读、文件等工具 |
+| `local_profiles/` | 分层、按需委派和实验配置及说明 |
+| `local_runner/` | 准备、执行、路由、费用、守卫、清理与离线测试 |
+| `tests/`、`apodex/tests/` | 开发回归测试 |
+| `benchmarks/`、`tools/` | 评测接口和开发工具，不包含此次发布禁止的真实评测内容 |
+| `docker/`、`Dockerfile` | 容器环境与入口 |
+| `docs/UPSTREAM_README.md` | 保留的上游项目说明 |
+| `MODIFICATIONS.md`、`NOTICE`、`LICENSE` | 改动清单、来源说明和许可证 |
 
-`uv sync` above installs the lightweight terminal runtime. Scientific and
-document packages are intentionally optional in native mode; the agent installs
-only what a task actually needs into `<project>/.apodex/runtime/native`. The
-`apodex` command is retained as a compatibility alias.
+## 致谢与许可证
 
-### Install once, launch from any project
+本项目基于 [ApodexAI/FrontierAgent](https://github.com/ApodexAI/FrontierAgent) 的上述 commit，采用 [Apache-2.0](LICENSE)。上游说明见 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)，本项目改动见 [MODIFICATIONS.md](MODIFICATIONS.md)，来源见 [NOTICE](NOTICE)。
 
-To run `frontier-agent` like any other command-line tool, install it from this
-repository with `uv` and keep the endpoint in one user file:
-
-```bash
-uv tool install --python 3.12 git+https://github.com/ApodexAI/FrontierAgent.git
-
-# Put OPENAI_API_KEY, OPENAI_BASE_URL and OPENAI_MODEL into
-# ${XDG_CONFIG_HOME:-$HOME/.config}/apodex/env and chmod 600 it.
-
-cd /path/to/project
-frontier-agent
-```
-
-Exported variables and a project `.env` still take precedence over the user
-file. On macOS with Docker running, the container image has to be built once
-from a clone. [Install once and launch from any project](docs/install/global-install.md)
-covers the PATH setup, the precedence rules, the Docker step, and updating.
-
-Prefer a script that does all of the above? `./scripts/run-macos.sh` and
-`./scripts/run-linux.sh` set up a hosted-endpoint install, and
-`./scripts/run-linux-gpu.sh --install-system-deps --setup-only` prepares a native,
-isolated SGLang environment on a Linux NVIDIA GPU. The step-by-step equivalent is
-the [endpoint quickstart](docs/install/tui-endpoint-quickstart.md)
-([中文教程](docs/install/tui-endpoint-quickstart.zh-CN.md)), which requires neither
-model self-hosting nor Docker.
-
-Local SGLang serving is pinned to reviewed NVIDIA driver / CUDA / SGLang tracks,
-and a mismatch surfaces late as opaque CUDA or Triton kernel errors during model
-load. Confirm your `nvidia-smi` driver against the
-[GPU compatibility matrix](docs/install/gpu-compatibility.md) before choosing an
-image tag or native pin. The GPU helper selects a reviewed userspace track from
-the host driver, but never installs or replaces the driver itself.
-
-### Deployment model
-
-The operating system, FrontierAgent runtime, and model runtime are independent
-choices. “NVIDIA” describes the local model service, not how the agent itself
-runs. Unsure which applies to your machine or GPU provider? Start with the
-**[installation chooser](docs/install/README.md)**.
-
-| Environment | FrontierAgent runtime | Model endpoint | Start here |
-|---|---|---|---|
-| macOS | native or Docker Desktop | hosted or another OpenAI-compatible endpoint | [macOS](docs/install/macos.md) |
-| Linux host/VM | native (default), bubblewrap, or Docker | hosted, native SGLang, or Docker SGLang | [Linux](docs/install/linux.md) |
-| managed Linux GPU container | native inside the provider container | custom GPU image or native SGLang | [GPU platforms](docs/install/gpu-platforms.md) |
-| Windows | WSL2, treated as Linux | hosted or a WSL2-reachable endpoint | [Linux/WSL2](docs/install/linux.md#windows-and-wsl2) |
-
-Chinese-speaking macOS users can use the
-[macOS 中文安装与一键启动指南](docs/install/macos.zh-CN.md).
-
-## Containers and local models
-
-Pre-built `linux/amd64` and `linux/arm64` images are published to the GitHub
-Container Registry, so no local Python environment is needed. That package is
-private, so `docker login ghcr.io` (with an account authorized for it) is
-required — otherwise build the checkout:
-
-```bash
-cp .env.example .env
-docker compose -f compose.yaml -f compose.dev.yaml build
-docker compose -f compose.yaml -f compose.dev.yaml run --rm agent
-```
-
-- [Run FrontierAgent in Docker](docs/install/docker.md) — Compose, image
-  pinning, direct `docker run`, and EC2/ECS deployment.
-- [Docker SGLang on a Linux NVIDIA host](docs/install/linux-nvidia.md) — two
-  containers on one network; SGLang owns the GPU.
-- [Native SGLang without nested Docker](docs/install/linux-nvidia-native.md) —
-  for managed GPU environments that forbid a nested daemon.
-- [SGLang configuration reference](config/sglang/README.md) — every `.env.sglang`
-  variable, token-budget invariants, and tuning order. Production 35B templates
-  for RTX 4090, RTX 5090, and two-GPU hosts live under `config/sglang/`.
-
-## Using the TUI
-
-Run without a task for an interactive session, or pass one and stay in the
-session for follow-ups:
-
-```bash
-uv run frontier-agent --mode agent_team --cwd /repo \
-  "Research the alternatives, verify the evidence, and write a report"
-
-# One-shot, line mode, or resume a saved session
-uv run frontier-agent --mode react --cwd /repo -p "explain src/main.py"
-uv run frontier-agent --mode agent_team --no-tui "compare these implementations"
-uv run frontier-agent --resume
-
-# Attach read-only documents before the TUI starts (repeatable)
-uv run frontier-agent --mode react --cwd /repo \
-  --input ~/Downloads/claim.pdf --input ~/Desktop/photo.jpg
-```
-
-The sidebar carries the plan/task board, live tool activity, deliverables, and a
-session-scoped diff. While a workflow is busy, typing a follow-up queues it for
-the next safe turn boundary rather than interrupting the run.
-
-For the four sidebar tabs, previews, approvals, attachments, clipboard support,
-keys, and Agent Team live steering, see the
-[TUI user guide](docs/tui-user-guide.md)
-([中文使用教程](docs/tui-user-guide.zh-CN.md)). The full slash-command, option,
-and theming reference is [`apodex/README.md`](apodex/README.md).
-
-## Workflow modes
-
-| Mode | Best for | Execution model |
-|---|---|---|
-| `react` | focused research, repository analysis, document/file work | one stateful agent using the `tui` workflow profile |
-| `agent_team` | broad questions that benefit from decomposition and parallel investigation | coordinator, persistent task board, bounded parallel sub-agents, report collection, synthesis |
-
-Agent Team parallelism is additional to benchmark concurrency. When evaluating,
-start with `--concurrency 1`; total simultaneous model calls can approach runner
-concurrency multiplied by the team spawn limit.
-
-Set `SWARM_NO_WEB=1` to disable Agent Team web tools or `REACT_NO_WEB=1` for
-closed-book ReAct tasks.
-
-## Filesystem and security model
-
-| Path | Policy | Purpose |
-|---|---|---|
-| `/inputs` | read-only | supplied documents and benchmark inputs |
-| `/workspace` | read-write | source checkout, extracted data, scratch work |
-| `/outputs` | controlled read-write | final persistent deliverables |
-
-File and shell tools share this one task sandbox and path policy. Interactive
-sessions add an approval gate on writes, deletion, package installation, and
-risky shell commands; some operations stay denied even with `--yes`; and file
-mutations are journaled so `/revert` can undo them.
-
-Details: [sandboxing and path policy](docs/framework.md#sandboxing),
-[approval and trace behavior](apodex/README.md#safety), and
-[the security policy](SECURITY.md).
-
-## Development
-
-```bash
-uv sync --frozen --extra sandbox --extra document-readers --extra eval --extra dev
-uv run pytest -q
-uv run ruff check .
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development environment,
-pre-flight checks, session debugging, and submission process. Building the
-container image is covered in
-[Run FrontierAgent in Docker](docs/install/docker.md#build-from-the-current-checkout).
-
-## Benchmark evaluation
-
-The evaluation harness runs each benchmark question in an isolated subprocess,
-supports resumable multi-run experiments, and dispatches benchmark-specific
-deterministic or model-based judges. A minimal smoke run, once the datasets are
-downloaded per [the evaluation guide](docs/eval.md#datasets), is:
-
-```bash
-uv sync --extra eval --extra sandbox --extra document-readers
-uv run python -m benchmarks.public.runner.run_subprocess \
-  --benchmark browsecomp --pipeline stateful-react-agent --profile default \
-  --limit 1 --concurrency 1 --out ./results/smoke
-```
-
-The [evaluation guide](docs/eval.md) is the canonical operator reference for
-credentials, judge preflight, datasets, file benchmarks, execution, and result
-inspection. The [benchmark registry](benchmarks/README.md) lists dataset keys,
-default pipelines, scoring implementations, and extension points.
-FrontierSearchBench has its own external scorer and an isolation requirement, so
-it is documented separately in
-[FrontierSearchBench evaluation](docs/eval-frontier-search.md).
-
-## Supported benchmarks
-
-BrowseComp, BrowseComp-ZH, xbench-DeepResearch, Humanity's Last Exam (text-only),
-SuperChem, FrontierScience-Research, FrontierScience-Olympiad, DeepSearchQA,
-WideSearch, FrontierSearchBench, OfficeQA, GDPval, APEX, and OneMillion-Bench.
-
-GDPval uses deterministic deliverable validation in this open-source harness;
-the agentic pairwise grader is intentionally excluded. The
-[benchmark registry](benchmarks/README.md#supported-benchmarks) is authoritative
-for each dataset key, its default pipeline, and its scoring implementation.
-
-## Apodex-1.1 performance
-
-The chart above compares the two FrontierAgent workflows with the Apodex-1.0
-baseline and selected external systems. The Apodex results are summarized here:
-
-| Configuration | APEX-Agents | GDPval | FrontierFinance | FrontierScience-Research | BioMysteryBench | HLE |
-|---|---:|---:|---:|---:|---:|---:|
-| Apodex-1.1 Agent Team | 38.5 | 78.8 | 54.3 | 63.3 | 35.3 | 56.1 |
-| Apodex-1.1 ReAct | 34.4 | 69.5 | 48.7 | 55.0 | 23.5 | 53.2 |
-| Apodex-1.0 | 16.5 | 59.3 | 40.3 | 28.3 | 17.6 | 49.0 |
-
-Earlier Apodex-1.0 checkpoints remain available in the
-[Hugging Face collection](https://huggingface.co/collections/apodex/apodex-1),
-with model cards and serving guidance.
-
-## Citation
-
-Cite the current release:
-
-```bibtex
-@article{apodex11,
-  title         = {Apodex-1.1: Scaling Agentic Intelligence for Complex Work},
-  author        = {Apodex Team},
-  year          = {2026},
-  eprint        = {2608.23283},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.AI},
-  url           = {https://arxiv.org/abs/2608.23283}
-}
-```
-
-```bibtex
-@misc{frontierchallenge,
-  title        = {FrontierChallenge: Evaluating Scientific Workflow Completion},
-  author       = {Su, Liangcai and Feng, Zhaopeng and Chen, Zhuo and Zhang, Zhen
-                  and Lin, Xiang and Li, Ruilin and Zhang, Handuo and Wang, Ning
-                  and Wen, Kailong and Guo, Yueqi and Xing, Feng and Guo, Yiling
-                  and Qian, Chenxiong and Du, Simon Shaolei and Bing, Lidong
-                  and Wang, Xinyu},
-  year         = {2026}
-}
-```
-
-For work that refers specifically to the previous generation:
-
-```bibtex
-@techreport{apodex10,
-  title  = {Apodex-1.0: A Verification-Centric Agent Team for Discoverative Intelligence},
-  author = {Apodex Team},
-  year   = {2026}
-}
-```
-
-## License
-
-Apache 2.0 — see [LICENSE](./LICENSE).
-
-## Star History
-
-<a href="https://github.com/ApodexAI/FrontierAgent/stargazers">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ApodexAI/FrontierAgent/star-history/assets/star-history/star-history-dark.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/ApodexAI/FrontierAgent/star-history/assets/star-history/star-history-light.svg" />
-    <img alt="Star History Chart" src="https://raw.githubusercontent.com/ApodexAI/FrontierAgent/star-history/assets/star-history/star-history-light.svg" />
-  </picture>
-</a>
+FrontierAgent、Apodex 等名称仅用于说明来源，不作为本项目品牌，也不表示上游对本项目或评测结果背书。许可证不授予商标权。发布历史为满足不分发题目、答案、运行记录和凭据的要求进行清理；来源 commit 标识用于追溯，不表示所有原始上游数据文件都被保留。
