@@ -1,10 +1,14 @@
 # Tiered Deep Research Agent
 
-A tiered research agent derived from [FrontierAgent](https://github.com/ApodexAI/FrontierAgent), with evidence-based escalation, independent answer checks, bounded spending, and optional multi-agent research. This repository contains source code and configuration, not benchmark questions, reference answers, or run artifacts. Reported results are scoped to the specific evaluations described below.
+A tiered research agent for multi-step information retrieval and evidence synthesis, with evidence-based escalation, independent answer checks, bounded spending, and optional multi-agent collaboration. This repository contains source code and configuration, not benchmark questions, reference answers, or run artifacts. Reported results are scoped to the specific evaluations described below.
 
 ## 项目简介
 
-本项目基于 FrontierAgent 二次开发，面向需要多轮搜索、阅读和关联证据的深度研究任务。上游基准为 `e4cb2397109c957a2f99c3a5d850b9fc479dbef6`。本项目保留其智能体运行框架、工具与 Agent Team 能力，增加分层路由、证据门禁、独立核查、按需委派、收敛控制、费用记录和来源防泄露守卫。
+本项目是一套面向复杂信息检索与多来源证据关联的分层研究智能体系统。项目围绕“如何根据研究进展分配计算资源、如何核查答案依据、如何让多智能体及时收敛”三个问题，对研究流程进行了程序化设计与实现。
+
+系统采用轻量研究、深度研究与可选团队协作的分层执行方式，根据证据状态和独立核查结果决定是否升级研究。开发重点包括分层路由、证据校验、答案选择、按需任务委派、研究停止与回收、费用记录及来源防泄露，并通过离线回归、真实题目运行和失败轨迹分析持续验证。
+
+项目将升级、委派准入、停止与答案替换等关键决策落实到运行代码中，目标是减少重复搜索、无效任务扩张以及证据不足时过早结束的问题。模型仍负责研究与语义判断，程序检查和核查状态的适用范围见下文。
 
 这里的“分层”由本次运行的证据状态决定，不预先按题号分配模型：先用 DeepSeek Flash 研究，未核实的答案再交给 DeepSeek Pro 独立研究；Agent Team 是显式启用的可选后备层。搜索使用 Serper，读页使用 Jina，沙箱使用 E2B。
 
@@ -12,6 +16,16 @@ A tiered research agent derived from [FrontierAgent](https://github.com/ApodexAI
 
 - `v2.3.2-dev30`：下文 DEV30 主结果对应的 V2.3.2 代码。
 - `v2.6.1-guard-v8`：V2.6.1 与防泄露守卫 v8；不能用它的名称重新标注 V2.3.2 的历史成绩。
+
+## 本项目的主要开发工作
+
+- **分层研究与模型路由。** 设计 Flash → Pro 的执行路径，接入可选 Agent Team 后备层；根据核查状态决定是否升级。Flash 与 Pro 的研究上下文隔离，Pro 不接收 Flash 的候选答案。实现见 [分层路由器](local_runner/tiered_router.py)。
+- **证据门禁与独立核查。** 将引文真实性、题目条件覆盖和语义支持分开处理：程序核对引用是否来自本次有效来源，独立核查进一步判断材料能否支持答案，同时保留未证实条件和冲突记录。实现见 [研究控制](workflows/agent_team/progressive.py) 与 [答案核查](workflows/agent_team/answer_settlement.py)。
+- **答案选择与停止逻辑。** 根据不同阶段的核查状态选择答案，同级结果保留较早答案；研究停止时对已有材料进行有界综合，记录答案状态和未解决问题，避免将空结果标为已完成。具体规则见 [分层研究说明](local_profiles/TIERED_RESEARCH_V2.md)。
+- **按需多智能体调度。** 改进团队委派流程，在显式启用的按需研究配置下，先声明具体事实缺口，再安排子任务；加入结构校验、依赖环检查、范围去重和并发入队控制。实现与边界见 [progressive_research_v1](local_profiles/PROGRESSIVE_RESEARCH_V1.md)。
+- **研究收敛与资源回收。** 实现 `review_research` 协议，记录研究进展、证据收据和剩余缺口；结束研究时冻结新研究工作，并衔接已有的取消与回收路径。实现见 [收敛控制](workflows/agent_team/convergence.py) 与 [清理流程](workflows/agent_team/convergence_cleanup.py)。
+- **预算、诊断与可追溯记录。** 在本地运行适配器中接入费用账本、运行期限和来源记录，保留工具调用与停止原因，使预算停止、技术故障和证据缺口能够分别分析。实现见 [预算适配器](local_runner/budget_adapter.py)、[运行入口](local_runner/run_native.py) 与 [任务监督](local_runner/task_supervisor.py)。
+- **评测口径与泄露审计。** 将冻结判分、名称形式裁定和来源泄露审计分开记录，保留历史判分及争议；结合回放、反例和真实运行对照检查改动效果。运行时加入 [来源防泄露守卫](local_runner/answer_label_guard.py)，审计方法、历史结果和证据范围见下文；原始评测记录不随仓库分发。
 
 ## 架构
 
@@ -210,6 +224,6 @@ python local_runner/tiered_router.py --questions ..\questions\own-questions.json
 
 ## 致谢与许可证
 
-本项目基于 [ApodexAI/FrontierAgent](https://github.com/ApodexAI/FrontierAgent) 的上述 commit，采用 [Apache-2.0](LICENSE)。上游说明见 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)，本项目改动见 [MODIFICATIONS.md](MODIFICATIONS.md)，来源见 [NOTICE](NOTICE)。
+基础智能体运行框架、部分工具及 Agent Team 工作流源自 [ApodexAI/FrontierAgent](https://github.com/ApodexAI/FrontierAgent)，对应的上游代码版本为 `e4cb2397109c957a2f99c3a5d850b9fc479dbef6`。本项目在此基础上设计和改进分层研究、证据核查与运行控制流程，具体修改见 [MODIFICATIONS.md](MODIFICATIONS.md)。项目采用 [Apache-2.0](LICENSE)，上游说明见 [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)，归属说明见 [NOTICE](NOTICE)。
 
 FrontierAgent、Apodex 等名称仅用于说明来源，不作为本项目品牌，也不表示上游对本项目或评测结果背书。许可证不授予商标权。发布历史为满足不分发题目、答案、运行记录和凭据的要求进行清理；来源 commit 标识用于追溯，不表示所有原始上游数据文件都被保留。
