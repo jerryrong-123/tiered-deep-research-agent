@@ -40,7 +40,7 @@ _final_request: ContextVar[tuple[ConvergenceState, object] | None] = ContextVar(
 # Unknown tools are not assumed local merely because their name says "read".
 _LOCAL_TOOLS = frozenset({
     "read_file", "grep_search", "glob_search", "recover_result", "stop_subagent",
-    "submit_report", "add_task", "update_task", "finish_planning",
+    "submit_report", "add_task", "update_task", "finish_planning", "calculate",
 })
 _PRIVATE_KEYS = frozenset({
     "reasoning", "reasoning_content", "thinking", "private", "private_reasoning",
@@ -102,6 +102,7 @@ class ConvergenceState:
         self.escalation: dict[str, Any] | None = None
         self.light_calls = 0
         self.archive_reads: Any = None
+        self.answer_leads: Any = None
         self._light_notice_sent = False
         self._search_notice_sent = False
         self.settlement: dict[str, Any] | None = None
@@ -298,11 +299,12 @@ class ConvergenceState:
         """
         if self.progressive is None:
             return None
-        from workflows.agent_team.progressive import SOURCE_TOOLS
+        from workflows.agent_team.progressive import CALCULATION_TOOL, SOURCE_TOOLS
 
-        if tool_name not in SOURCE_TOOLS or not tool_call_id:
+        if tool_name not in SOURCE_TOOLS | {CALCULATION_TOOL} or not tool_call_id:
             return None
-        self.progressive.observe_tool(tool_name, tool_call_id, is_error=is_error)
+        if tool_name in SOURCE_TOOLS:
+            self.progressive.observe_tool(tool_name, tool_call_id, is_error=is_error)
         public_args = _public_metadata(arguments)
         identity = hashlib.sha256(json.dumps(
             ["main_tool", tool_call_id, tool_name, public_args, result, is_error],
@@ -627,6 +629,7 @@ class ConvergenceState:
             **({"escalation": self.escalation} if self.escalation is not None else {}),
             **({"light_calls": self.light_calls} if self.light_calls else {}),
             **({"archive_reads": self.archive_reads.used} if self.archive_reads and self.archive_reads.used else {}),
+            **({"answer_leads": self.answer_leads.summary()} if self.answer_leads and self.answer_leads.offered else {}),
             **({"settlement": self.settlement} if self.settlement is not None else {}),
         })
 
@@ -839,9 +842,19 @@ def convergence_run(
 
         state.archive_reads = ArchiveReads(state.progressive.tier["archive_reads"], state.count_light_calls)
         saved_pages = open_archive_reads(state.archive_reads)
+    leads = None
+    if state is not None and state.tier_active and state.progressive.tier["answer_leads"]:
+        from plugins.tools._answer_leads import AnswerLeads, open_answer_leads
+
+        state.answer_leads = AnswerLeads(question, state.progressive.tier["answer_leads"])
+        leads = open_answer_leads(state.answer_leads)
     try:
         yield state
     finally:
+        if leads is not None:
+            from plugins.tools._answer_leads import close_answer_leads
+
+            close_answer_leads(leads)
         if saved_pages is not None:
             from plugins.tools._archive_copy import close_archive_reads
 

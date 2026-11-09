@@ -60,6 +60,10 @@ class Layer:
 LAYERS = (Layer("flash", "tiered_light_stage_v2.yaml", "", ""),
           Layer("pro", "tiered_light_stage_v2_deep.yaml", "deepseek-v4-pro", ""))
 TEAM_LAYER = Layer("fat", "convergence_v1.yaml", "", "10")
+# The relation-graph fallback, approved on 2026-11-03 with a per-question cap of
+# ¥50, above the ¥25 Flash and Pro keep. Its answer replaces an earlier one only
+# when verified; otherwise it is kept as a side answer.
+GRAPH_LAYER = Layer("graph", "graph_fallback_v1.yaml", "deepseek-v4-pro", "50")
 
 
 @dataclass(frozen=True)
@@ -107,7 +111,8 @@ def read_outcome(trial: Path, layer: Layer) -> dict[str, Any]:
     """What one finished trial produced, in the terms routing needs."""
     worker = _load(trial / "WORKER_RESULT.json")
     ledger = worker.get("model_ledger") or _load(trial / "MODEL_LEDGER.json")
-    saved = next(iter(sorted(trial.glob("native/**/convergence_v1.json"))), None)
+    saved = (next(iter(sorted(trial.glob("native/**/convergence_v1.json"))), None)
+             or next(iter(sorted(trial.glob("native/**/graph_v1.json"))), None))
     state = _load(saved) if saved else {}
     settlement = state.get("settlement") or {}
     text = str(worker.get("answer") or "")
@@ -116,7 +121,8 @@ def read_outcome(trial: Path, layer: Layer) -> dict[str, Any]:
                "check": settlement.get("check", ""), "answer": "", "delivered": "", "returned": returned,
                "stop_reason": (state.get("escalation") or {}).get("reason", ""), "calls": ledger.get("calls", 0),
                "estimate_cny": str(ledger.get("spent_estimate_cny") or 0),
-               "held_cny": str(ledger.get("unknown_held_upper_cny") or 0), "seconds": worker.get("duration_s")}
+               "held_cny": str(ledger.get("unknown_held_upper_cny") or 0), "seconds": worker.get("duration_s"),
+               "earlier_refuted": settlement.get("earlier_refuted") is True}
     if not returned or not text or text.startswith(MARKER):
         outcome["kind"] = settlement.get("kind", "") if returned else "technical_failure"
         return outcome
@@ -146,7 +152,13 @@ def credibility(outcome: dict[str, Any]) -> int:
     if outcome["level"] == "none":
         return 0
     if outcome["level"] == "verified":
-        return 3
+        return 4
+    if outcome.get("layer") == GRAPH_LAYER.name:
+        # The fallback's unverified answer replaces an earlier one only when both of
+        # its checks found the earlier answer contradicted by the research and its own
+        # not (rule (a), approved 2026-11-03); otherwise it is delivered only when no
+        # earlier layer gave an answer.
+        return 3 if outcome.get("earlier_refuted") else 1
     return 2 if outcome["kind"] in {"independent_check", "team_answer"} else 1
 
 
@@ -167,6 +179,11 @@ def search_health(trial: Path) -> tuple[int, int]:
             working += str(item.get("status")) == "200"
             refused += CREDIT_ERROR in str(item.get("text"))
     return working, refused
+
+
+def searched(trial: Path) -> bool:
+    """Whether the trial sent any search at all."""
+    return any("serper" in str(_load(path).get("host")) for path in (trial / "web_responses").glob("*"))
 
 
 def models_used(trial: Path) -> tuple[set[Any], set[Any]]:
@@ -260,7 +277,10 @@ class Router:
         reasoning, extraction = models_used(trial)
         after = (_load(trial / "MODEL_BALANCE_AFTER.json").get("balances") or [{}])[0].get("total_balance")
         self.balance = after if after is not None else self.balance
-        if refused or (outcome["returned"] and not working):
+        # A graph trial can end before its research starts, with no search sent; that
+        # says nothing about the search service, unlike a light run without a working search.
+        if refused or (outcome["returned"] and not working
+                       and (layer.name != GRAPH_LAYER.name or searched(trial))):
             self.halt("search_unavailable")
         if "deepseek-v4-pro" in extraction:
             self.halt("extraction_used_pro")
@@ -275,9 +295,12 @@ class Router:
         if after is not None and Decimal(str(after)) < self.limits.min_balance_cny:
             self.halt("balance_limit")
 
-    def run_layer(self, question: dict[str, str], layer: Layer) -> dict[str, Any]:
+    def run_layer(self, question: dict[str, str], layer: Layer, earlier: str = "") -> dict[str, Any]:
         trial = self.trial_for(question, layer)
         fresh = not (trial / "STARTED.json").exists()
+        if fresh and earlier:
+            # The graph trial compares this with its evidence only if it verifies nothing itself.
+            (trial / "EARLIER_ANSWER.json").write_text(json.dumps({"answer": earlier}, ensure_ascii=False), encoding="utf-8")
         code = self.launch(trial) if fresh else None
         outcome = read_outcome(trial, layer)
         outcome["launch_exit"] = code
@@ -300,7 +323,8 @@ class Router:
             started = (self.out / question["id"] / layer.name / "STARTED.json").exists()
             if self.stop and not started:
                 break
-            outcomes.append(self.run_layer(question, layer))
+            earlier = choose(outcomes) if layer.name == GRAPH_LAYER.name else None
+            outcomes.append(self.run_layer(question, layer, earlier=(earlier or {}).get("answer", "")))
             if settled(outcomes[-1], stop_doubted=self.stop_doubted):
                 finished = True
                 break
@@ -371,13 +395,16 @@ def main() -> None:
     parser.add_argument("--max-held-cny", default=Limits.max_held_cny, type=Decimal,
                         help="Held upper bound that stops new runs. Finished runs count on a resume.")
     parser.add_argument("--with-fat", action="store_true", help="Add the team as a last layer.")
+    parser.add_argument("--with-graph", action="store_true", help="Add the relation-graph fallback as a last layer.")
     parser.add_argument("--stop-doubted", action="store_true", help="Also stop on a gate-passed answer the check doubted.")
     parser.add_argument("--workers", default=2, type=int)
     parser.add_argument("--docker", default="docker")
     parser.add_argument("--dry-run", action="store_true", help="Check the input and print the plan; start nothing.")
     args = parser.parse_args()
     questions = load_questions(args.questions)
-    layers = (*LAYERS, TEAM_LAYER) if args.with_fat else LAYERS
+    if args.with_fat and args.with_graph:
+        parser.error("choose one last layer: --with-fat or --with-graph")
+    layers = (*LAYERS, TEAM_LAYER) if args.with_fat else (*LAYERS, GRAPH_LAYER) if args.with_graph else LAYERS
     plan = {"questions": len(questions), "layers": [layer.name for layer in layers], "max_total_cny": str(args.max_total_cny),
             "max_held_cny": str(args.max_held_cny), "out": args.out, "workers": args.workers,
             "stop_doubted": args.stop_doubted}

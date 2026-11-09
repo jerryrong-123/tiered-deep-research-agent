@@ -41,7 +41,8 @@ async def test_benchmark_session_bootstraps_team_runtime(monkeypatch: pytest.Mon
                 f"{dataset} references unregistered pipeline "
                 f"{config.default_pipeline!r}"
             )
-        assert len(registry.get(ResourceManager).all_tools) == 23
+        # 23 built-ins until V2.4 added the local calculator.
+        assert len(registry.get(ResourceManager).all_tools) == 24
         assert registry.get(AgentBus) is not None
         assert registry.get(SpawnGuard) is not None
         task = await registry.get(ProcessManager).create_task("runtime contract")

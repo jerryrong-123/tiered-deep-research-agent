@@ -21,6 +21,17 @@ from frontier_agent.infra.summary_llm import (
     summary_llm_candidates,
 )
 from frontier_agent.infra.usage_meter import record_api_request, record_llm_usage
+from plugins.tools._answer_leads import (
+    CONFIRMED,
+    EXTRACTION_RULE,
+    AnswerLeads,
+    check_prompt,
+    current_answer_leads,
+    parse_check,
+    render,
+    split_lead,
+    window,
+)
 from plugins.tools._archive_copy import (
     copy_url,
     current_archive_reads,
@@ -356,6 +367,14 @@ CONTENT TO ANALYZE:
 EXTRACTED INFORMATION:"""
 
 
+def _extraction_prompt(info_to_extract: str, text: str, question: str = "") -> str:
+    """The reference prompt, with the answer-lead rule and the question only when leads are on."""
+    if not question:
+        return _EXTRACT_INFO_PROMPT.format(info_to_extract, text)
+    head, tail = _EXTRACT_INFO_PROMPT.split("CONTENT TO ANALYZE:", 1)
+    return head.format(info_to_extract) + EXTRACTION_RULE.format(question) + "CONTENT TO ANALYZE:" + tail.format(text)
+
+
 def _truncate_fallback(content: str) -> str:
     """Raw-content path used when no summary LLM is reachable."""
     if len(content) > FALLBACK_TRUNCATE:
@@ -367,6 +386,7 @@ async def _extract_info_with_llm(
     content: str,
     info_to_extract: str,
     truncate_last_num_chars: int = -1,
+    question: str = "",
 ) -> dict[str, Any]:
     """Call the cheap SUMMARY_LLM to focus-extract from the scraped page.
 
@@ -426,7 +446,7 @@ async def _extract_info_with_llm(
         "success": False, "extracted_info": "", "error": "No response",
     }
     for cand in candidates:
-        last = await _extract_with_candidate(cand, content, text, info_to_extract)
+        last = await _extract_with_candidate(cand, content, text, info_to_extract, question)
         if last["success"] and last["extracted_info"]:
             return last
     return last
@@ -437,11 +457,12 @@ async def _extract_with_candidate(
     content: str,
     text: str,
     info_to_extract: str,
+    question: str = "",
 ) -> dict[str, Any]:
     """One candidate's extraction attempt (reference retry policy)."""
     endpoint = cand["endpoint"]
     model = cand["model"]
-    prompt = _EXTRACT_INFO_PROMPT.format(info_to_extract, text)
+    prompt = _extraction_prompt(info_to_extract, text, question)
 
     payload: dict[str, Any] = {
         "model": model,
@@ -487,9 +508,10 @@ async def _extract_with_candidate(
                 "exceeds the model's maximum context length" in response.text
                 or "longer than the model's context length" in response.text
             ):
-                payload["messages"][0]["content"] = _EXTRACT_INFO_PROMPT.format(
+                payload["messages"][0]["content"] = _extraction_prompt(
                     info_to_extract,
                     content[: -(40960 * attempt)] + "[...truncated]",
+                    question,
                 )
                 continue
 
@@ -553,6 +575,83 @@ async def _extract_with_candidate(
         "extracted_info": "",
         "error": f"Unexpected response: {data}",
     }
+
+
+# ── Answer leads ──────────────────────────────────────────────────────
+
+# Same cap as page extraction, so the runner counts a lead check as a page-model call.
+_LEAD_CHECK_MAX_TOKENS = 8192
+
+
+def _lead_check_payload(model: str, prompt: str) -> dict[str, Any]:
+    """The extraction call's payload rules, for the same model."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": _LEAD_CHECK_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 1.0,
+    }
+    if "gpt" in model:
+        payload["max_completion_tokens"] = payload.pop("max_tokens")
+    if any(k in model.lower() for k in ("qwen", "apodex", "sglang", "397b")):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    return payload
+
+
+async def _ask_lead_check(prompt: str) -> str:
+    """One call on the page-extraction model. A failure reads as no verdict."""
+    for cand in summary_llm_candidates():
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if cand.get("api_key"):
+            headers["Authorization"] = f"Bearer {cand['api_key']}"
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    cand["endpoint"],
+                    headers=headers,
+                    json=_lead_check_payload(cand["model"], prompt),
+                    timeout=httpx.Timeout(None, connect=30, read=300),
+                )
+            response.raise_for_status()
+            data = response.json()
+            reply = data["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.warning("Lead check failed on %s: %s", cand.get("model"), e)
+            continue
+        usage = data.get("usage") or {}
+        if usage:
+            record_llm_usage(
+                model=cand["model"],
+                provider=cand.get("provider") or "summary_llm",
+                prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                cache_read_tokens=int(
+                    (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
+                ),
+            )
+        if reply:
+            return reply
+    return ""
+
+
+async def _settle_lead(url: str, content: str, extracted: str, leads: AnswerLeads) -> str:
+    """Drop the summarizer's raw lead line; add the lead back only once a separate check confirms it."""
+    cleaned, sentence = split_lead(extracted)
+    if not sentence:
+        return extracted
+    leads.offered += 1
+    around = window(content, sentence)
+    if not around:
+        leads.dropped += 1
+        return cleaned
+    if not leads.take(url, sentence):
+        return cleaned
+    reply = await _ask_lead_check(check_prompt(leads.question, sentence, around))
+    verdict, quotes = parse_check(reply, around)
+    leads.verdicts[verdict] += 1
+    if verdict in CONFIRMED and quotes:
+        return f"{cleaned}\n\n{render(sentence, verdict, quotes)}"
+    return cleaned
 
 
 # ── Saved copy of a page the live web did not deliver ─────────────────
@@ -736,13 +835,17 @@ async def _fetch_single(
         recovered = await _read_saved_copy(url, info_to_extract, live_failed=True)
         return recovered or f"[ERROR]: Scraping failed: {exc}"
 
-    result = await _extract_info_with_llm(content, info_to_extract)
+    leads = current_answer_leads()
+    # With no focus the page comes back raw, and no extractor has judged it.
+    focused = bool(info_to_extract and info_to_extract.strip())
+    question = leads.question if leads is not None and focused else ""
+    result = await _extract_info_with_llm(content, info_to_extract, question=question)
     if not result["success"]:
         return f"[ERROR]: Extraction failed: {result['error']}"
     extracted = result["extracted_info"]
+    if question:
+        extracted = await _settle_lead(url, content, extracted, leads)
     not_rendered = _render_kind(content) == "empty"
-    # With no focus the page comes back raw, and no extractor has judged it.
-    focused = bool(info_to_extract and info_to_extract.strip())
     if not_rendered or (focused and reports_missing(extracted)):
         recovered = await _read_saved_copy(
             url, info_to_extract, live_failed=not_rendered,

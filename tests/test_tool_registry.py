@@ -7,6 +7,7 @@ EXPECTED_TOOLS = {
     "add_task",
     "assign_task",
     "bash",
+    "calculate",
     "collect_reports",
     "create_file",
     "create_subagent",

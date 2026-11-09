@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import unicodedata
 from contextlib import contextmanager
@@ -40,11 +41,13 @@ TIER_DEFAULTS = {
     "show_low_value_results": False,
     "unquote_single_words": False,
     "archive_reads": 0,  # Saved pages one run may read; 0 means none.
+    "calculator": False,  # The prompt asks for `calculate` on comparisons and totals.
+    "answer_leads": 0,  # Lead checks one run may make; 0 means no leads.
 }
 TIER_SWITCHES = ("tiered_escalation", "stop_at_escalation", "answer_chain_gate",
                  "synthesize_at_stop", "independent_check", "show_low_value_results",
-                 "unquote_single_words")
-ZERO_MEANS_OFF = ("max_search_queries", "archive_reads")
+                 "unquote_single_words", "calculator")
+ZERO_MEANS_OFF = ("max_search_queries", "archive_reads", "answer_leads")
 # Quoting one word demands that exact word, so a page using a synonym drops out.
 # Phrases keep their quotes, as do names and numbers, which have no synonym to lose.
 _QUOTED_WORD = re.compile(r'"([a-z]+(?:-[a-z]+)*)"')
@@ -60,6 +63,13 @@ GAP_KINDS = ("missing_relation", "source_conflict", "candidate_discovery")
 SOURCE_TOOLS = frozenset({"web_search", "web_fetch", "read_file", "grep_search",
                           "glob_search", "download_file", "recover_result"})
 READ_TOOLS = SOURCE_TOOLS - {"web_search", "glob_search"}
+# A calculation is kept as a receipt so a row can cite it, but it is not a source:
+# it neither counts as a read nor needs a search before it.
+CALCULATION_TOOL = "calculate"
+_NUMBER = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
+# Conversion factors and small counts need no page behind them.
+_UNIT_NUMBERS = frozenset({0, 1, 2, 3, 4, 5, 7, 10, 12, 24, 30, 31, 60, 100, 365, 366, 1000,
+                           1.609344, 1609.344, 0.621371, 0.3048, 3.28084})
 _assignments: ContextVar[dict[str, dict[str, Any]]] = ContextVar(
     "progressive_assignments", default={},
 )
@@ -122,6 +132,36 @@ def _quote_phrases(quote: Any) -> list[str]:
     if sum(len(piece) for piece in pieces) < MIN_QUOTE_WORDS:
         return []
     return [_phrase(piece) for piece in pieces]
+
+
+def _numbers(text: Any) -> set[float]:
+    """Every number in a text, unsigned: a page writes 73.56° W where a calculation has -73.56."""
+    return {float(match.replace(",", "")) for match in _NUMBER.findall(unicodedata.normalize("NFKC", str(text)))}
+
+
+def unquoted_calculation_inputs(question: str, rows: list[Any], found_rows: list[tuple[int, str]],
+                                receipts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """A calculation counts only when each input comes from the question or a quoted page."""
+    def is_calculation(found: str) -> bool:
+        return ((receipts.get(found) or {}).get("source") or {}).get("tool_name") == CALCULATION_TOOL
+
+    calculations = [(index, found) for index, found in found_rows if is_calculation(found)]
+    if not calculations:
+        return []
+    sourced = _numbers(question)
+    for index, found in found_rows:
+        if not is_calculation(found):
+            sourced |= _numbers(rows[index].get("evidence_quote", ""))
+    problems = []
+    for index, found in calculations:
+        report = str(receipts[found].get("report") or "")
+        line = next((item for item in report.splitlines() if item.startswith("INPUTS:")), "")
+        missing = [number for number in sorted(_numbers(line)) if number not in _UNIT_NUMBERS
+                   and not any(math.isclose(number, known, rel_tol=1e-9) for known in sourced)]
+        if missing:
+            problems.append({"row": index, "problem": "calculation_input_not_quoted",
+                             "inputs": [f"{number:g}" for number in missing[:5]]})
+    return problems
 
 
 def ask_positions(question: str) -> list[int]:
@@ -348,17 +388,20 @@ class ProgressivePolicy:
         """
         tokens = _words(question)
         covered = [False] * len(tokens)
-        problems, corrections = [], []
+        problems, corrections, found_rows = [], [], []
         bodies = {key: _phrase(_words(receipt.get("report", ""))) for key, receipt in receipts.items()
                   if receipt["status"] in _SUCCESSFUL_RECEIPTS}
         for index, row in enumerate(rows if isinstance(rows, list) else []):
             problem, positions, found = self._row_problem(row, tokens, bodies)
             if problem:
                 problems.append({"row": index, "problem": problem})
-            elif found != row["receipt_id"]:
-                corrections.append({"row": index, "cited": row["receipt_id"], "found": found})
+            else:
+                found_rows.append((index, found))
+                if found != row["receipt_id"]:
+                    corrections.append({"row": index, "cited": row["receipt_id"], "found": found})
             for position in positions:
                 covered[position] = True
+        problems += unquoted_calculation_inputs(question, rows, found_rows, receipts)
         content = [i for i, token in enumerate(tokens) if token not in _STOPWORDS]
         hits = sum(covered[i] for i in content)
         percent = 100 * hits // len(content) if content else 100

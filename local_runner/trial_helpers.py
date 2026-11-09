@@ -86,10 +86,20 @@ def held_upper(payload):
     size=len(json.dumps(payload).encode())+TEMPLATE_MARGIN+PER_MESSAGE*len(payload.get('messages') or [])
     return (Decimal(min(INPUT_UPPER[model],size))*uncached+Decimal(payload['max_tokens'])*output)*2/Decimal(1000000)
 
+# Lead checks open with this mark (plugins/tools/_answer_leads.py). They are metered like every call
+# and also tallied on their own line, so the ledger shows what the feature costs.
+LEAD_CHECK_MARK='LEAD CHECK'
+
+def is_lead_check(payload):
+    messages=payload.get('messages') or []
+    first=messages[0] if messages and isinstance(messages[0],dict) else {}
+    return isinstance(first.get('content'),str) and first['content'].startswith(LEAD_CHECK_MARK)
+
 class Meter:
     def __init__(self):
         self.spent=Decimal(0); self.held=Decimal(0); self.reserved=Decimal(0)
         self.calls=0; self.lock=asyncio.Lock(); self.entries={}
+        self.lead_checks={'calls':0,'spent':Decimal(0),'held':Decimal(0)}
     def snapshot(self):
         return {'spent_estimate_cny':str(self.spent),'unknown_held_upper_cny':str(self.held),
             'inflight_reserved_upper_cny':str(self.reserved),'target_cny':'20','hard_cap_cny':str(HARD),
@@ -97,7 +107,9 @@ class Meter:
             'rates_cny_per_1M_offpeak':{'cached':'.02','uncached':'1','output':'4'},
             'rates_by_model_cny_per_1M_offpeak':{k:[str(x) for x in v] for k,v in RATES.items()},
             'verified_offpeak_window_utc':{'start':'2026-10-29T14:10:39+00:00','end_exclusive':'2026-10-30T01:00:00+00:00'},'settlement_policy':'maximum start/end timeband; verified night window factor1; otherwise original conservative policy; estimate not invoice',
-            'cut_call_held_policy':'request body bound, at most the reservation'}
+            'cut_call_held_policy':'request body bound, at most the reservation',
+            'lead_check':{'calls':self.lead_checks['calls'],'spent_estimate_cny':str(self.lead_checks['spent']),
+                'unknown_held_upper_cny':str(self.lead_checks['held']),'included_in_totals':True}}
     def write(self): save(HERE/'MODEL_LEDGER.json',self.snapshot())
     async def reserve(self,payload,role):
         # Reserve the complete supported context at peak uncached price, not a guessed tokenizer count.
@@ -109,21 +121,24 @@ class Meter:
             if self.spent+self.held+self.reserved+amount>HARD: raise TrialStop('model_budget_admission_exhausted')
             ident=self.calls;self.calls+=1;self.reserved+=amount
             self.entries[ident]={'amount':amount,'started':datetime.now(timezone.utc),'input_upper':input_upper,'model':model,
-                'held_upper':min(amount,held_upper(payload))}
+                'held_upper':min(amount,held_upper(payload)),'lead_check':is_lead_check(payload)}
             self.write();emit('model_admitted',call=ident,role=role,reserved_upper_cny=str(amount))
         return ident
     async def settle(self,ident,usage):
         async with self.lock:
             e=self.entries.pop(ident);self.reserved-=e['amount']
             u=numeric_usage(usage)
+            if e.get('lead_check'): self.lead_checks['calls']+=1
             if u is None:
                 self.held+=e.get('held_upper',e['amount']); charge=None
+                if e.get('lead_check'): self.lead_checks['held']+=e.get('held_upper',e['amount'])
             else:
                 factor=max(multiplier(e['started']),multiplier(datetime.now(timezone.utc)))
                 charge=cost(u,factor,e.get('model','deepseek-flash'))
                 if charge>e['amount']:
                     self.spent+=charge;self.write();raise TrialStop('reservation_bound_violated')
                 self.spent+=charge
+                if e.get('lead_check'): self.lead_checks['spent']+=charge
             self.write();emit('model_accounted',call=ident,usage=u,estimated_charge_cny=None if charge is None else str(charge))
 
 def safe_error(exc):

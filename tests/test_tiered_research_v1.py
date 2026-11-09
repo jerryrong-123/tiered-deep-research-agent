@@ -536,9 +536,12 @@ _LONG_QUESTION = ("A filmmaker decided to become a director after watching a Bra
 
 def test_one_shared_phrase_is_not_a_copy_of_the_question(tmp_path):
     guard = AnswerLabelGuard(_LONG_QUESTION, tmp_path)
-    assert guard.width == 14
+    # 68 question words: the audit's 15% share is a run of 11.
+    assert guard.width == 11
     phrase = "[1] **Bill Condon**\nHe decided to become a director after watching a Brazilian film in 1970.\nURL: https://example.org/a\n"
     assert guard.filter_search(phrase) == phrase
+    longer = phrase.replace("Brazilian film in", "Brazilian film and later")
+    assert guard.filter_search(longer).strip() == MARKER
 
 
 def test_a_long_copied_run_is_still_withheld(tmp_path):
@@ -548,9 +551,9 @@ def test_a_long_copied_run_is_still_withheld(tmp_path):
     assert guard.filter_search(copied).strip() == MARKER
 
 
-def test_short_questions_keep_the_eight_word_floor(tmp_path):
+def test_short_questions_follow_the_audit_share_without_a_floor(tmp_path):
     guard = AnswerLabelGuard("Which small town did the author of that memoir about Ohio grow up in?", tmp_path)
-    assert guard.width == 8
+    assert guard.width == 3
 
 
 @pytest.mark.parametrize("config", [

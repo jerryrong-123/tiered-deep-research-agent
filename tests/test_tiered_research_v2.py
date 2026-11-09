@@ -1,8 +1,10 @@
 """Offline checks for the answer-chain rules of the tiered light stage."""
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -109,10 +111,14 @@ def test_the_v2_profile_differs_from_v1_only_by_declared_controls():
     first["agent"]["progressive_config"].pop("min_question_coverage_pct")
     extra = {key: controls.pop(key) for key in (
         "answer_chain_gate", "min_ask_coverage_pct", "max_search_queries", "synthesize_at_stop",
-        "independent_check", "show_low_value_results", "unquote_single_words", "archive_reads")}
+        "independent_check", "show_low_value_results", "unquote_single_words", "archive_reads",
+        "calculator", "answer_leads")}
     assert extra == {"answer_chain_gate": True, "min_ask_coverage_pct": 80, "max_search_queries": 40,
                      "synthesize_at_stop": True, "independent_check": True, "show_low_value_results": True,
-                     "unquote_single_words": True, "archive_reads": 10}
+                     "unquote_single_words": True, "archive_reads": 10, "calculator": True, "answer_leads": 3}
+    # V2.4 offers the calculator to the main model and to helpers.
+    for key in ("main_agent_tools", "sub_agent_tools"):
+        assert second["agent"][key].pop() == "calculate"
     assert second == first
 
 
@@ -183,11 +189,8 @@ def test_evaluation_sources_are_withheld_and_quarantined(tmp_path, entry):
     assert stages == ["search_eval_source", "search_quarantined_source"]
 
 
-@pytest.mark.parametrize("entry", [
-    "[1] **A paper page**\nSnippet.\nURL: https://huggingface.co/papers/2401.00001\n",
-    "[1] **Ordinary page**\nThese evaluation logs were stored on tape.\nURL: https://example.org/a\n",
-])
-def test_ordinary_entries_survive_the_source_rule(tmp_path, entry):
+def test_ordinary_entries_survive_the_source_rule(tmp_path):
+    entry = "[1] **Ordinary page**\nThese evaluation logs were stored on tape.\nURL: https://example.org/a\n"
     assert AnswerLabelGuard(QUESTION, tmp_path).filter_search(entry) == entry
 
 
@@ -195,6 +198,98 @@ def test_fetching_an_evaluation_source_is_withheld(tmp_path):
     guard = AnswerLabelGuard(QUESTION, tmp_path)
     args = {"url": "https://huggingface.co/datasets/some-org/agent-runs"}
     assert guard.filter_fetch("Page body", args, "tool_result:web_fetch") == MARKER
+
+
+# The audit's A/B/C rules (guard v8) -----------------------------------------
+
+@pytest.mark.parametrize("entry", [
+    "[1] **A paper page**\nSnippet.\nURL: https://huggingface.co/papers/2401.00001\n",
+    "[1] **A notebook**\nSnippet.\nURL: https://www.kaggle.com/code/some-org/islands\n",
+    "[1] **Agent trajectories for web tasks**\nSnippet.\nURL: https://example.org/a\n",
+])
+def test_any_page_on_an_audit_host_or_title_is_withheld(tmp_path, entry):
+    assert AnswerLabelGuard(QUESTION, tmp_path).filter_search(entry).strip() == MARKER
+
+
+def test_a_run_at_the_audit_share_is_withheld_and_one_word_shorter_is_not(tmp_path):
+    guard = AnswerLabelGuard(QUESTION, tmp_path)
+    tokens = re.findall(r"\w+", QUESTION.casefold())
+    at_share = " ".join(tokens[:guard.width])
+    below = " ".join(tokens[:guard.width - 1])
+    assert guard.filter_search(f"[1] **Notes**\n{at_share} and more.\nURL: https://example.org/a\n").strip() == MARKER
+    assert guard.screen("bash", f"output: {at_share}", {"command": "python3 x.py"}) == MARKER
+    survivor = f"[1] **Notes**\n{below} zebra.\nURL: https://example.org/b\n"
+    assert AnswerLabelGuard(QUESTION, tmp_path).filter_search(survivor) == survivor
+
+
+def test_a_run_split_only_by_the_url_line_is_withheld(tmp_path):
+    guard = AnswerLabelGuard(QUESTION, tmp_path)
+    tokens = re.findall(r"\w+", QUESTION.casefold())
+    half = guard.width // 2
+    entry = f"[1] **{' '.join(tokens[:half])}**\nURL: https://example.org/a\n{' '.join(tokens[half:guard.width])}\n"
+    assert guard.filter_search(entry).strip() == MARKER
+
+
+@pytest.mark.parametrize("text", ["Island notes. Explanation: the record.", "ground_truth = 'x'", "Rationale： it fits."])
+def test_audit_labels_are_withheld_from_page_and_shell_output(tmp_path, text):
+    guard = AnswerLabelGuard(QUESTION, tmp_path)
+    assert guard.screen("web_fetch", text, {"url": "https://example.org/a"}) == MARKER
+    assert guard.screen("bash", text, {"command": "cat notes.txt"}) == MARKER
+
+
+def test_recovered_search_entries_are_screened_like_search_results(tmp_path):
+    guard = AnswerLabelGuard(QUESTION, tmp_path)
+    recovered = ("[recovered]\n[1] **Ordinary**\nA snippet.\nURL: https://example.org/a\n\n"
+                 "[2] **Papers**\nLEAK\nURL: https://huggingface.co/papers/1\n")
+    screened = guard.screen("recover_result", recovered, {"turn": 3, "call_id": "c1"})
+    assert "LEAK" not in screened and "Ordinary" in screened and MARKER in screened
+
+
+@pytest.mark.parametrize("command,refused", [
+    ("curl -sL https://huggingface.co/datasets/x/y/resolve/main/a.json", True),
+    ("wget kaggle.com/datasets/x", True),
+    ("curl 'https://www.google.com/search?q=browsecomp+answer'", True),
+    ("curl -s https://example.org/page | head -50", False),
+    ("python3 <<'PY'\nprint(sum([1, 2]))\nPY", False),
+])
+def test_shell_commands_naming_an_evaluation_source_are_refused(tmp_path, command, refused):
+    assert AnswerLabelGuard(QUESTION, tmp_path).refuses_command(command) is refused
+
+
+def test_a_quarantined_url_is_refused_to_the_shell(tmp_path):
+    guard = AnswerLabelGuard(QUESTION, tmp_path)
+    guard.filter_search("[1] **Notes**\nCandidate Answer: x\nURL: https://example.org/leak\n")
+    assert guard.refuses_command("curl https://www.example.org/leak/")
+
+
+def test_markers_carry_no_audit_label(tmp_path):
+    from local_runner.answer_label_guard import SEEK_MARKER, labelled
+    assert not labelled(MARKER) and not labelled(SEEK_MARKER)
+
+
+def test_shell_and_download_are_refused_before_they_run(tmp_path):
+    from local_runner.answer_label_guard import install_guard
+    bash_tool = importlib.import_module("plugins.tools.bash")
+    download_tool = importlib.import_module("plugins.tools.download_file")
+    sandbox_run = AsyncMock(return_value="ran")
+    original_run = download_tool.arun_sandbox_cmd
+    download_tool.arun_sandbox_cmd = sandbox_run
+    try:
+        _, restore = install_guard(QUESTION, tmp_path)
+        try:
+            assert bash_tool.bash_output_write_error("curl https://huggingface.co/datasets/x/y") == MARKER
+            assert not bash_tool.bash_output_write_error("ls -la")
+            with pytest.raises(RuntimeError):
+                asyncio.run(download_tool.arun_sandbox_cmd(object(), "python3 - 'https://www.kaggle.com/datasets/x'"))
+            assert asyncio.run(download_tool.arun_sandbox_cmd(object(), "python3 - 'https://example.org/a.pdf'")) == "ran"
+            assert sandbox_run.await_count == 1
+        finally:
+            restore()
+        assert download_tool.arun_sandbox_cmd is sandbox_run
+    finally:
+        download_tool.arun_sandbox_cmd = original_run
+    stages = [json.loads(line)["stage"] for line in (tmp_path / "ANSWER_LABEL_GUARD.jsonl").read_text().splitlines()]
+    assert stages == ["bash_refused_before_run", "download_refused_before_run"]
 
 
 # Evidence and labels --------------------------------------------------------

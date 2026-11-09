@@ -1091,6 +1091,15 @@ look for a benchmark's or evaluation's answer to this question; use independent
 factual sources.
 """
 
+_CALCULATOR_RULE = """
+Use `calculate` for every comparison, difference or total of numbers, dates or
+distances that the answer depends on, instead of judging it by eye. For the
+distance between two places use `distance_km` with coordinates copied from the
+evidence. Cite the calculation receipt in a `requirements` row and give each
+input number a row that quotes where it came from: a calculation counts only
+when every input is quoted from a page or stated in the question.
+"""
+
 _PROGRESSIVE_PLANNING = """
 # Planning Mode (ENABLED)
 While this phase is active, inspect the question and available input with the
@@ -1215,6 +1224,8 @@ def get_main_system_prompt(
             template = (_TIERED_ANSWER_CHAIN if progressive_config.get("answer_chain_gate")
                         else _TIERED_RESEARCH)
             team_section += template.format(**{**TIER_DEFAULTS, **progressive_config})
+            if progressive_config.get("calculator"):
+                team_section += _CALCULATOR_RULE
         if show_finish_planning:
             team_section = _PROGRESSIVE_PLANNING + team_section
         elif phase == "execution":

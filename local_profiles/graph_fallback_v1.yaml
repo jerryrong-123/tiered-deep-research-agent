@@ -1,0 +1,76 @@
+# Relation-graph fallback: the last layer, after Flash and Pro left a question
+# without a verified answer. The controller replaces the coordinator loop; see
+# outputs/fallback_controller_design_20261103/DESIGN.md. Model calls and
+# sub-agents run on Pro (OPENAI_MODEL=deepseek-v4-pro, set by the router), and the
+# two Flash checks go to the page-extraction model. Explicit opt-in only.
+llm:
+  provider: ${OPENAI_PROVIDER:-openai}
+  model: ${OPENAI_MODEL}
+  base_url: ${OPENAI_BASE_URL}
+  api_key: ${OPENAI_API_KEY}
+  temperature: 1.0
+  top_p: 0.95
+  extra_body:
+    top_k: 20
+  max_tokens: ${OPENAI_MAX_TOKENS:-32768}
+
+report_llm:
+  provider: ${OPENAI_PROVIDER:-openai}
+  model: ${OPENAI_MODEL}
+  base_url: ${OPENAI_BASE_URL}
+  api_key: ${OPENAI_API_KEY}
+  temperature: 0.0
+  max_tokens: ${OPENAI_MAX_TOKENS:-32768}
+  llm_timeout_s: 600
+
+agent:
+  graph_fallback_v1: true
+  # Every structural cap, written out so none changes silently. Approved with the
+  # design on 2026-11-03; they are upper bounds, not quotas.
+  graph_fallback_config:
+    decompositions: 3
+    redo_per_decomposition: 2
+    check_rounds: 3
+    rechecks_during_run: 2
+    max_branches: 4
+    agents_per_relation: 2
+    extra_agents_per_conflict: 1
+    # V2.6, approved on 2026-11-03: research sub-agents on Flash and up to 40 of
+    # them; decomposition, checks, judging, the final checks, the re-verifier and
+    # the closing synthesis stay on the trial's Pro.
+    max_subagents: 40
+    max_parallel: 4
+    subagent_turns: 20
+    subagent_queries: 25
+    subagent_model: deepseek-flash
+    replans: 2
+    max_candidates: 5
+    wide_candidates: 30
+    wide_batch: 10
+    next_steps: 6
+    repair_rounds: 3
+    min_coverage_pct: 95
+    verification_reserve_cny: "8"
+    format_retries: 2
+  reporter_backend: fast
+  main_max_turns: 200
+  sub_max_turns: 20
+  tool_timeout_s: 360
+  llm_timeout_s: 600
+  reasoning_only_timeout_s: 120
+  reasoning_only_max_tokens: 16384
+  logical_call_timeout_s: 900
+  thinking_in_history: true
+  context_compaction: tiered
+  compaction_spill: ${COMPACTION_SPILL:-false}
+  max_len: ${OPENAI_CONTEXT_WINDOW:-262144}
+  tier1_keep_tool_result: 5
+  keep_recent_turns: 5
+  max_input_tokens: ${OPENAI_MAX_INPUT_TOKENS:-229376}
+  share_search_results: true
+  planning_mode: false
+  web_search_impl: original
+  web_fetch_impl: aligned
+  # The controller itself calls no tools; the list only satisfies the node's setup.
+  main_agent_tools: [web_search]
+  sub_agent_tools: [web_search, web_fetch, submit_report, bash, download_file, grep_search, glob_search, read_file, create_file, recover_result, calculate]

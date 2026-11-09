@@ -16,7 +16,9 @@ else:
 
 HERE = Path(__file__).resolve().parent
 ALLOWED_MODELS = ("deepseek-v4-pro",)
-SEALED_HARD_CAP = Decimal(25)
+# Raised from 25 on 2026-11-03 for the relation-graph fallback's ¥50 per question.
+# Trials that pass no cap keep trial_helpers' default of 25, as Flash and Pro do.
+SEALED_HARD_CAP = Decimal(50)
 TEMPLATE_FILES = (
     "run_native.py", "trial_helpers.py", "budget_adapter.py", "task_supervisor.py",
     "answer_label_guard.py", "tool_classification.py", "sandbox_registry.py",
@@ -141,7 +143,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--profile-file", type=Path)
     parser.add_argument("--model", default="", choices=("", *ALLOWED_MODELS))
-    parser.add_argument("--hard-cap", default="", help="Ledger cap in CNY for this trial, at most 25.")
+    parser.add_argument("--hard-cap", default="", help="Ledger cap in CNY for this trial, at most the sealed 50.")
     args = parser.parse_args()
     metadata = prepare(args.question_json, args.out, profile_file=args.profile_file, model=args.model,
                        hard_cap=args.hard_cap)

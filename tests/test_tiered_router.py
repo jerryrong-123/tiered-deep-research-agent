@@ -11,7 +11,8 @@ import pytest
 
 from local_runner import tiered_router as router
 from local_runner.prepare import prepare
-from local_runner.tiered_router import LAYERS, TEAM_LAYER, Limits, Router, choose, load_questions, models_used, settled
+from local_runner.tiered_router import (GRAPH_LAYER, LAYERS, TEAM_LAYER, Limits, Router, choose, load_questions,
+                                        models_used, settled)
 
 QUESTION = "Which street is left of the 1902 factory?"
 ROW = {"id": "q1", "question": QUESTION}
@@ -43,7 +44,7 @@ class Script:
         spec = dict(self.plan[name])
         _write(trial / "STARTED.json", {})
         settlement, escalation = spec.pop("settlement", None), spec.pop("escalation", None)
-        model = "deepseek-v4-pro" if trial.name == "pro" else "deepseek-flash"
+        model = "deepseek-v4-pro" if trial.name in ("pro", "graph") else "deepseek-flash"
         answer = spec.pop("text", "")
         if spec.pop("failed", False):
             _write(trial / "WORKER_RESULT.json", {"technical_status": "technical_incomplete", "model_ledger": {"calls": 1}})
@@ -60,7 +61,8 @@ class Script:
                              "unknown_held_upper_cny": spec.pop("held", "0")}})
         _write(trial / "MODEL_BALANCE_AFTER.json", {"balances": [{"total_balance": spec.pop("balance", "50")}]})
         status, text = spec.pop("search", (200, "ok"))
-        _write(trial / "web_responses/a.json", {"host": "google.serper.dev", "status": status, "text": text})
+        if not spec.pop("no_search", False):
+            _write(trial / "web_responses/a.json", {"host": "google.serper.dev", "status": status, "text": text})
         events = spec.pop("events", None) or [{"kind": "model_request", "model": model, "tools": ["web_search"], "max_tokens": 32768}]
         (trial / "events.jsonl").write_text("\n".join(json.dumps(item) for item in events), encoding="utf-8")
         return 0
@@ -376,14 +378,87 @@ def test_preparing_a_capped_layer_passes_its_cap_to_the_container(tmp_path):
     assert json.loads((tmp_path / "trial/PREPARED.json").read_text(encoding="utf-8"))["hard_cap_cny"] == "10"
 
 
-@pytest.mark.parametrize("cap", ["26", "0", "-1", "lots"])
+# The seal rose from 25 to 50 on 2026-11-03 for the relation-graph fallback.
+@pytest.mark.parametrize("cap", ["51", "0", "-1", "lots"])
 def test_a_trial_cap_can_only_lower_the_sealed_one(tmp_path, cap):
     with pytest.raises(ValueError, match="invalid_hard_cap"):
         prepare(_question_file(tmp_path), tmp_path / "trial", hard_cap=cap)
 
 
+def test_flash_and_pro_set_no_cap_and_keep_the_default_of_25(tmp_path):
+    from local_runner import trial_helpers
+
+    assert [layer.hard_cap_cny for layer in LAYERS] == ["", ""]
+    assert trial_helpers.HARD == Decimal(25)
+    prepare(_question_file(tmp_path), tmp_path / "trial", profile_file=router.PROFILES / LAYERS[1].profile,
+            model=LAYERS[1].model, hard_cap=LAYERS[1].hard_cap_cny)
+    assert "TRIAL_HARD_CNY" not in (tmp_path / "trial/launch.ps1").read_text(encoding="utf-8")
+
+
+def test_preparing_the_graph_layer_passes_its_model_and_cap(tmp_path):
+    prepare(_question_file(tmp_path), tmp_path / "trial", profile_file=router.PROFILES / GRAPH_LAYER.profile,
+            model=GRAPH_LAYER.model, hard_cap=GRAPH_LAYER.hard_cap_cny)
+    launch = (tmp_path / "trial/launch.ps1").read_text(encoding="utf-8")
+    assert "'-e','OPENAI_MODEL=deepseek-v4-pro','-e','TRIAL_HARD_CNY=50')" in launch
+
+
 def test_every_layer_profile_exists():
-    assert all((router.PROFILES / layer.profile).is_file() for layer in (*LAYERS, TEAM_LAYER))
+    assert all((router.PROFILES / layer.profile).is_file() for layer in (*LAYERS, TEAM_LAYER, GRAPH_LAYER))
+
+
+GRAPH_VERIFIED = {"kind": "graph_fallback", "level": "verified", "check": "supported", "reason": ""}
+GRAPH_UNVERIFIED = {"kind": "graph_fallback", "level": "best_effort", "check": "insufficient", "reason": "not_verified"}
+
+
+def test_the_graph_layer_replaces_a_doubted_answer_only_when_verified(tmp_path):
+    graph = {"settlement": GRAPH_VERIFIED, "text": "Graph street\n\nEvidence level: verified", "state_answer": "Graph street"}
+    plan = {"q1/flash": _gate(DOUBTED), "q1/pro": _gate(DOUBTED), "q1/graph": graph}
+    script, _, rows = _route(tmp_path / "off", plan)
+    assert script.launched == ["q1/flash", "q1/pro"]
+    script, _, rows = _route(tmp_path / "on", plan, layers=(*LAYERS, GRAPH_LAYER))
+    assert script.launched == ["q1/flash", "q1/pro", "q1/graph"]
+    assert (rows[0]["layer"], rows[0]["level"], rows[0]["answer"]) == ("graph", "verified", "Graph street")
+
+
+def test_an_unverified_graph_answer_replaces_an_earlier_one_only_when_it_refuted_it(tmp_path):
+    graph = {"settlement": GRAPH_UNVERIFIED, "text": "Graph guess\n\nEvidence level: best_effort", "state_answer": "Graph guess"}
+    script, _, rows = _route(tmp_path / "forced", {"q1/flash": _forced(), "q1/pro": _empty(), "q1/graph": graph},
+                             layers=(*LAYERS, GRAPH_LAYER))
+    assert (rows[0]["layer"], rows[0]["answer"]) == ("flash", "Forced guess")
+    assert rows[0]["path"][-1]["level"] == "best_effort" and rows[0]["path"][-1]["earlier_refuted"] is False
+    # The graph trial was handed the answer it would have to refute.
+    handed = json.loads((tmp_path / "forced/out/q1/graph/EARLIER_ANSWER.json").read_text(encoding="utf-8"))
+    assert handed == {"answer": "Forced guess"}
+    refuted = dict(graph, settlement={**GRAPH_UNVERIFIED, "earlier_refuted": True})
+    _, _, rows = _route(tmp_path / "refuted", {"q1/flash": _gate(DOUBTED), "q1/pro": _gate(DOUBTED), "q1/graph": refuted},
+                        layers=(*LAYERS, GRAPH_LAYER))
+    assert (rows[0]["layer"], rows[0]["level"], rows[0]["answer"]) == ("graph", "best_effort", "Graph guess")
+    # With nothing earlier, the graph's best effort is what gets delivered.
+    _, _, rows = _route(tmp_path / "nothing", {"q1/flash": _empty(), "q1/pro": _empty(), "q1/graph": graph},
+                        layers=(*LAYERS, GRAPH_LAYER))
+    assert (rows[0]["layer"], rows[0]["level"], rows[0]["answer"]) == ("graph", "best_effort", "Graph guess")
+    assert not (tmp_path / "nothing/out/q1/graph/EARLIER_ANSWER.json").exists()
+
+
+def test_a_graph_trial_that_sent_no_search_does_not_stop_the_batch(tmp_path):
+    graph = {"settlement": {"kind": "graph_fallback", "level": "none", "reason": "decomposition_failed"},
+             "text": "[ESCALATION_REQUIRED] reason=decomposition_failed", "no_search": True}
+    plan = {"q1/flash": _empty(), "q1/pro": _empty(), "q1/graph": graph}
+    _, summary, rows = _route(tmp_path / "graph", plan, layers=(*LAYERS, GRAPH_LAYER))
+    assert summary["stop"] == "" and rows[0]["level"] == "none"
+    # A light run that returned without a working search still stops the batch.
+    _, summary, _ = _route(tmp_path / "flash", {"q1/flash": _empty(no_search=True)})
+    assert summary["stop"] == "search_unavailable"
+
+
+def test_a_graph_trial_is_read_from_its_own_state_file(tmp_path):
+    trial = tmp_path / "trial"
+    _write(trial / "WORKER_RESULT.json", {"technical_status": "pipeline_returned",
+                                          "answer": "Graph street\n\nEvidence level: verified", "model_ledger": {"calls": 3}})
+    _write(trial / "native/agent/trajectories/graph_v1.json", {"answer": "Graph street", "settlement": GRAPH_VERIFIED})
+    outcome = router.read_outcome(trial, GRAPH_LAYER)
+    assert (outcome["level"], outcome["kind"], outcome["check"], outcome["answer"]) == (
+        "verified", "graph_fallback", "supported", "Graph street")
 
 
 def test_the_deep_profile_changes_only_its_budget():

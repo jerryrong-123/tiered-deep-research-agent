@@ -124,10 +124,19 @@ def synthesis_prompt(question: str, evidence: str) -> str:
     return _SYNTHESIS_PROMPT.format(question=question, evidence=evidence)
 
 
+_CALCULATION_NOTE = """
+A quote that starts with CALCULATION was computed by a calculator: its RESULT follows from its INPUTS. Check that each input matches a number in the other quotes.
+"""
+
+
 def check_prompt(question: str, answer: str, rows: list[dict[str, Any]]) -> str:
     evidence = "\n".join(f"{index}. Condition: {row.get('question_span', '')}\n   Quote: {row.get('evidence_quote', '')}"
                          for index, row in enumerate(rows, 1))
-    return _CHECK_PROMPT.format(question=question, answer=answer, evidence=evidence)
+    prompt = _CHECK_PROMPT.format(question=question, answer=answer, evidence=evidence)
+    # Only answers that cite a calculation see the note, so every other check reads as before.
+    if any(str(row.get("evidence_quote", "")).lstrip().upper().startswith("CALCULATION") for row in rows):
+        prompt = prompt.replace("\nReturn JSON only:", _CALCULATION_NOTE + "\nReturn JSON only:", 1)
+    return prompt
 
 
 def parse_reply(text: Any) -> dict[str, Any] | None:

@@ -1590,6 +1590,20 @@ async def _run_main_agent_node(
         "workspace_root": shared_workspace_dir,
     }
 
+    if agent_cfg.get("graph_fallback_v1") is True:
+        # The relation-graph fallback replaces the coordinator loop; it reuses
+        # this run's sub-agent runtime, sandbox and scope for its sub-agents.
+        from workflows.agent_team.graph_fallback_node import run_graph_fallback
+        try:
+            return await run_graph_fallback(
+                question=question, metadata=metadata, llm=llm, runtime=swarm_runtime,
+                scope_meta=_scope_meta, agent_cfg=agent_cfg, directory=traj_dir, task_id=bus_task_id,
+            )
+        finally:
+            reset_filesystem_state(fs_token)
+            if main_sb_token is not None:
+                clear_task_sandbox(main_sb_token)
+
     light_started = time.monotonic()
 
     async def _run_main_loop(

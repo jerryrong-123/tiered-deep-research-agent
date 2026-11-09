@@ -50,6 +50,11 @@ def check_source():
     assert hashlib.sha256(q['question'].encode()).hexdigest()==q['question_sha256']
     return q
 
+def earlier_answer():
+    """The answer an earlier layer delivered, which the router hands a graph trial."""
+    path=HERE/'EARLIER_ANSWER.json'
+    return str(json.loads(path.read_text(encoding='utf-8')).get('answer') or '') if path.exists() else ''
+
 def selected_profile():
     import yaml
     return yaml.safe_load((Path(__file__).resolve().parent/'PROFILE.yaml').read_text(encoding='utf-8'))
@@ -342,7 +347,8 @@ async def worker():
         async with BenchmarkSession() as session:
             pipeline=asyncio.create_task(session.run(q['question'],pipeline_id='agent_team',meta={
                 'profile':'benchmark','profile_inline':selected_profile(),'profile_overrides':overrides(),'_trial_dir':str(HERE/'native'),
-                'question_id':q['id'],'pipeline_id':'agent_team','benchmark':'browsecomp'}))
+                'question_id':q['id'],'pipeline_id':'agent_team','benchmark':'browsecomp',
+                **({'earlier_answer':earlier} if (earlier:=earlier_answer()) else {})}))
             stopper=asyncio.create_task(meter.stop.wait())
             done,_=await asyncio.wait([pipeline,stopper],timeout=DEADLINE,return_when=asyncio.FIRST_COMPLETED)
             if pipeline in done:

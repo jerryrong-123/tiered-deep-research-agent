@@ -72,6 +72,8 @@ agent:
     show_low_value_results: true
     unquote_single_words: true
     archive_reads: 10
+    calculator: true
+    answer_leads: 3
     max_requirement_words: 30
     escalate_after_gate_rejections: 3
     escalate_after_main_turns: 24
@@ -133,7 +135,7 @@ agent:
   web_search_impl: original
   web_fetch_impl: aligned
   # Main starts research directly. Helpers report only assigned evidence gaps.
-  main_agent_tools: [create_subagent, assign_task, collect_reports, stop_subagent, add_task, update_task, finish_planning, grep_search, glob_search, web_search, web_fetch, download_file, read_file]
+  main_agent_tools: [create_subagent, assign_task, collect_reports, stop_subagent, add_task, update_task, finish_planning, grep_search, glob_search, web_search, web_fetch, download_file, read_file, calculate]
   # The coordinator tools of convergence_v1, used after escalation.
   team_main_agent_tools: [create_subagent, assign_task, collect_reports, stop_subagent, add_task, update_task, finish_planning, grep_search, glob_search, web_search]
-  sub_agent_tools: [web_search, web_fetch, submit_report, bash, download_file, grep_search, glob_search, read_file, create_file, recover_result]
+  sub_agent_tools: [web_search, web_fetch, submit_report, bash, download_file, grep_search, glob_search, read_file, create_file, recover_result, calculate]

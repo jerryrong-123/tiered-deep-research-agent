@@ -7,6 +7,7 @@ import logging
 from frontier_agent.core.tool import Tool
 from plugins.tools.assign_task import assign_task
 from plugins.tools.bash import bash
+from plugins.tools.calculate import calculate
 from plugins.tools.collect_reports import collect_reports
 from plugins.tools.create_file import create_file
 from plugins.tools.create_subagent import create_subagent
@@ -55,6 +56,7 @@ _BUILTIN_TOOLS: list[Tool] = [
     glob_search,
     run_python_code,
     recover_result,
+    calculate,
 ]
 
 

@@ -105,6 +105,9 @@ TOOL_META: dict[str, ToolMeta] = {
         max_result_chars=_EXEC_RESULT_MAX_CHARS,
     ),
 
+    # Calculator — local arithmetic, no network or sandbox, concurrent-safe
+    "calculate": ToolMeta(is_read_only=True, concurrency_safe=True, timeout=5, category="compute"),
+
     # Meta — tool discovery
     "tool_search": ToolMeta(is_read_only=True, concurrency_safe=True, timeout=5, category="meta"),
 
